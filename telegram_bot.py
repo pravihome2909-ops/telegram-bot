@@ -109,7 +109,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not is_approved_user(chat_id):
         await update.message.reply_text(
-            _access_denied(), parse_mode="Markdown")
+            _access_denied()
+        )
         return ConversationHandler.END
 
     context.user_data.clear()
