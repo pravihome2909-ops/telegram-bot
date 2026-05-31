@@ -120,7 +120,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "━━━━━━━━━━━━━━━━\n"
         "📚 *Step 1 of 4*\n"
         "Please enter the *Class* \\(e\\.g\\. 10\\):",
-        parse_mode="MarkdownV2",
         reply_markup=ReplyKeyboardRemove(),
     )
     return STATE_CLASS
