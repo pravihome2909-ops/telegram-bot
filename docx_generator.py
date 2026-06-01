@@ -1,12 +1,13 @@
 """
 docx_generator.py
-Layout:  A4, Left=2cm, Right=2cm, Top=1.9cm, Bottom=1.9cm, Line spacing=1.15
+Layout:  A4, Left=-2cm, Right=-2cm, Top=1.9cm, Bottom=1.9cm, Line spacing=1.15
 Header:  Class, Lesson(s), Marks only
 Footer:  All The Best  +  watermark EduPulse-JB (bottom-right)
 Tamil:   Uses Latha font (Windows built-in) or NotoSansTamil-Regular.ttf
 """
 
 import os
+import platform
 from datetime import datetime
 
 try:
@@ -27,7 +28,7 @@ BASE_DIR        = os.path.dirname(os.path.abspath(__file__))
 
 # Tamil font — Latha is built into Windows.
 # On Linux (Railway): set to "Noto Sans Tamil" and install fonts-lohit-taml
-TAMIL_FONT = "Latha" if platform.system() == "Windows" else "Lohit Tamil"
+TAMIL_FONT = "Latha"
 
 SECTION_TITLES = {
     1: "Section A — Choose the Best Answer",
