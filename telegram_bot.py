@@ -1,18 +1,9 @@
 """
 telegram_bot.py  —  TN Exam Telegram Bot
-
-Teacher conversation flow:
-  /start → Class → Subject → Lesson → Marks type → Confirm → PDF sent
-
-Run locally:
-    python telegram_bot.py
-
-Deploy to Railway:
-    Push this file + requirements.txt + Procfile to GitHub repo.
-    Set TELEGRAM_BOT_TOKEN and FIREBASE_CREDENTIALS_JSON as env vars on Railway.
-
-Install deps:
-    pip install python-telegram-bot==20.7 firebase-admin reportlab
+Flow:
+  /start → Class → Subject → Lessons (multi) → 
+  How many 1-mark? → How many 2-mark? → 
+  How many 3-mark? → How many 5-mark? → Confirm → PDF + DOCX sent
 """
 
 import os
@@ -34,9 +25,9 @@ from firebase_sync import (
     get_db,
     FIRESTORE_QUESTIONS_COLLECTION,
 )
-from pdf_generator import generate_question_paper_pdf
+from pdf_generator  import generate_question_paper_pdf
+from docx_generator import generate_question_paper_docx
 
-# ── Logging ───────────────────────────────────────────────────────────
 logging.basicConfig(
     format="%(asctime)s — %(levelname)s — %(message)s",
     level=logging.INFO,
@@ -45,39 +36,38 @@ logger = logging.getLogger(__name__)
 
 # ── Conversation states ───────────────────────────────────────────────
 (STATE_CLASS, STATE_SUBJECT, STATE_LESSON,
- STATE_MARKS_TYPE, STATE_CUSTOM_MARKS, STATE_CONFIRM) = range(6)
+ STATE_Q1, STATE_Q2, STATE_Q3, STATE_Q5,
+ STATE_CONFIRM) = range(8)
 
-# ── Marks options ─────────────────────────────────────────────────────
-MARKS_OPTIONS = {
-    "1️⃣  1-Mark Only":  [1],
-    "2️⃣  2-Mark Only":  [2],
-    "3️⃣  3-Mark Only":  [3],
-    "5️⃣  5-Mark Only":  [5],
-    "🔀  Mixed (All)":   [1, 2, 3, 5],
-    "⚙️  Custom":        "custom",
-}
+# Lesson keyboard constants
+SELECTED_PREFIX = "✅ "
+DONE_LESSON     = "Done ✔ Confirm Lessons"
+ALL_LESSONS     = "Select All Lessons"
+
+# Quick-count buttons shown when asking "how many?"
+COUNT_BUTTONS = ["0", "5", "10", "15", "20", "Custom"]
 
 
 # ── Helpers ───────────────────────────────────────────────────────────
 
-def _kb(options: list, cols: int = 2) -> ReplyKeyboardMarkup:
+def _kb(options: list, cols: int = 2,
+        one_time: bool = False) -> ReplyKeyboardMarkup:
     rows = [options[i:i+cols] for i in range(0, len(options), cols)]
     return ReplyKeyboardMarkup(rows, resize_keyboard=True,
-                                one_time_keyboard=True)
+                                one_time_keyboard=one_time)
 
 
 def _access_denied() -> str:
     return (
-        "⛔ *Access Denied*\n\n"
+        "⛔ Access Denied\n\n"
         "You are not authorised to use this bot.\n"
-        "Please contact your school admin to get approved."
+        "Contact your school admin to get approved."
     )
 
 
-def _get_subjects_for_class(class_: str) -> list:
-    """Fetch distinct subjects for a class from Firestore."""
+def _get_subjects(class_: str) -> list:
     try:
-        db   = get_db()
+        db = get_db()
         if db is None:
             return []
         docs = db.collection(FIRESTORE_QUESTIONS_COLLECTION).stream()
@@ -86,7 +76,8 @@ def _get_subjects_for_class(class_: str) -> list:
             for d in docs
             if str(d.to_dict().get("class", "")) == str(class_)
         })
-    except Exception:
+    except Exception as e:
+        logger.error(f"_get_subjects error: {e}")
         return []
 
 
@@ -94,8 +85,31 @@ def _get_lessons(class_: str, subject: str) -> list:
     try:
         qs = fetch_questions_from_firestore(class_, subject)
         return sorted({q.get("lesson", "") for q in qs if q.get("lesson")})
-    except Exception:
+    except Exception as e:
+        logger.error(f"_get_lessons error: {e}")
         return []
+
+
+def _get_available_count(questions: list, marks: int) -> int:
+    return len([q for q in questions if q.get("marks") == marks])
+
+
+def _lesson_keyboard(all_lessons: list,
+                     selected: list) -> ReplyKeyboardMarkup:
+    rows = []
+    for i in range(0, len(all_lessons), 2):
+        row = []
+        for les in all_lessons[i:i+2]:
+            row.append((SELECTED_PREFIX + les)
+                       if les in selected else les)
+        rows.append(row)
+    rows.append([ALL_LESSONS, DONE_LESSON])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True,
+                                one_time_keyboard=False)
+
+
+def _count_keyboard() -> ReplyKeyboardMarkup:
+    return _kb(COUNT_BUTTONS, cols=3, one_time=True)
 
 
 # ── /start ────────────────────────────────────────────────────────────
@@ -103,23 +117,19 @@ def _get_lessons(class_: str, subject: str) -> list:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
     name    = update.effective_user.full_name
-
-    # Print Chat ID to console so admin can approve the teacher
-    print(f"[Bot] /start from {name}  |  Chat ID: {chat_id}")
+    logger.info(f"/start  {name}  {chat_id}")
 
     if not is_approved_user(chat_id):
-        await update.message.reply_text(
-            _access_denied()
-        )
+        await update.message.reply_text(_access_denied())
         return ConversationHandler.END
 
     context.user_data.clear()
     await update.message.reply_text(
-        f"👋 Welcome, *{name}*!\n\n"
-        "📝 I will help you generate a question paper step by step.\n\n"
+        f"👋 Welcome, {name}!\n\n"
+        "📝 Let's generate a question paper step by step.\n\n"
         "━━━━━━━━━━━━━━━━\n"
-        "📚 *Step 1 of 4*\n"
-        "Please enter the *Class* \\(e\\.g\\. 10\\):",
+        "📚 Step 1 of 6\n"
+        "Enter the Class (e.g. 10):",
         reply_markup=ReplyKeyboardRemove(),
     )
     return STATE_CLASS
@@ -130,28 +140,27 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def get_class(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     if not text:
-        await update.message.reply_text("⚠️ Please enter a valid class.")
+        await update.message.reply_text("Please enter a valid class.")
         return STATE_CLASS
 
     context.user_data["class"] = text
-    subjects = _get_subjects_for_class(text)
+    subjects = _get_subjects(text)
+    logger.info(f"Class={text!r}  subjects={subjects}")
 
     if subjects:
         await update.message.reply_text(
-            f"✅ Class: *{text}*\n\n"
+            f"✅ Class: {text}\n\n"
             "━━━━━━━━━━━━━━━━\n"
-            "📖 *Step 2 of 4*\n"
-            "Select or type the *Subject*:",
-            parse_mode="Markdown",
-            reply_markup=_kb(subjects, cols=3),
+            "📖 Step 2 of 6\n"
+            "Select the Subject:",
+            reply_markup=_kb(subjects, cols=3, one_time=True),
         )
     else:
         await update.message.reply_text(
-            f"✅ Class: *{text}*\n\n"
+            f"✅ Class: {text}\n\n"
             "━━━━━━━━━━━━━━━━\n"
-            "📖 *Step 2 of 4*\n"
-            "Type the *Subject* name:",
-            parse_mode="Markdown",
+            "📖 Step 2 of 6\n"
+            "Type the Subject name:",
             reply_markup=ReplyKeyboardRemove(),
         )
     return STATE_SUBJECT
@@ -162,123 +171,323 @@ async def get_class(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def get_subject(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     if not text:
-        await update.message.reply_text("⚠️ Please enter a valid subject.")
+        await update.message.reply_text("Please enter a valid subject.")
         return STATE_SUBJECT
 
-    context.user_data["subject"] = text
-    lessons = _get_lessons(context.user_data["class"], text)
+    context.user_data["subject"]          = text
+    context.user_data["selected_lessons"] = []
 
-    if lessons:
+    lessons = _get_lessons(context.user_data["class"], text)
+    context.user_data["all_lessons"] = lessons
+    logger.info(f"Subject={text!r}  lessons={lessons}")
+
+    if not lessons:
         await update.message.reply_text(
-            f"✅ Subject: *{text}*\n\n"
+            f"✅ Subject: {text}\n\n"
             "━━━━━━━━━━━━━━━━\n"
-            "📂 *Step 3 of 4*\n"
-            "Select or type the *Lesson*:",
-            parse_mode="Markdown",
-            reply_markup=_kb(lessons, cols=2),
-        )
-    else:
-        await update.message.reply_text(
-            f"✅ Subject: *{text}*\n\n"
-            "━━━━━━━━━━━━━━━━\n"
-            "📂 *Step 3 of 4*\n"
-            "Type the *Lesson* name or number:",
-            parse_mode="Markdown",
+            "📂 Step 3 of 6\n"
+            "Type the Lesson name:",
             reply_markup=ReplyKeyboardRemove(),
         )
+        return STATE_LESSON
+
+    kb = _lesson_keyboard(lessons, [])
+    await update.message.reply_text(
+        f"✅ Subject: {text}\n\n"
+        "━━━━━━━━━━━━━━━━\n"
+        "📂 Step 3 of 6 — Select Lessons\n\n"
+        "Tap lessons to select (✅ = selected).\n"
+        "You can select multiple lessons.\n"
+        f"Tap  '{ALL_LESSONS}'  to select all.\n"
+        f"Tap  '{DONE_LESSON}'  when done.",
+        reply_markup=kb,
+    )
     return STATE_LESSON
 
 
-# ── Step 3 — Lesson ───────────────────────────────────────────────────
+# ── Step 3 — Lesson multi-select ─────────────────────────────────────
 
 async def get_lesson(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if not text:
-        await update.message.reply_text("⚠️ Please enter a valid lesson.")
+    text     = update.message.text.strip()
+    all_les  = context.user_data.get("all_lessons", [])
+    selected = context.user_data.get("selected_lessons", [])
+
+    # ── Manual entry (no lessons from cloud) ──
+    if not all_les:
+        context.user_data["selected_lessons"] = [text]
+        context.user_data["lesson_display"]   = text
+        return await _ask_q1(update, context)
+
+    # ── Select All ──
+    if text == ALL_LESSONS:
+        context.user_data["selected_lessons"] = list(all_les)
+        kb = _lesson_keyboard(all_les, all_les)
+        await update.message.reply_text(
+            f"✅ All {len(all_les)} lessons selected!\n"
+            f"Tap  '{DONE_LESSON}'  to continue.",
+            reply_markup=kb,
+        )
         return STATE_LESSON
 
-    context.user_data["lesson"] = text
-    await update.message.reply_text(
-        f"✅ Lesson: *{text}*\n\n"
-        "━━━━━━━━━━━━━━━━\n"
-        "🎯 *Step 4 of 4*\n"
-        "Choose the *Marks type* for the paper:",
-        parse_mode="Markdown",
-        reply_markup=_kb(list(MARKS_OPTIONS.keys()), cols=2),
-    )
-    return STATE_MARKS_TYPE
+    # ── Done ──
+    if text == DONE_LESSON:
+        if not selected:
+            kb = _lesson_keyboard(all_les, selected)
+            await update.message.reply_text(
+                "⚠️ Please select at least one lesson first.",
+                reply_markup=kb,
+            )
+            return STATE_LESSON
+        context.user_data["lesson_display"] = ", ".join(selected)
+        return await _ask_q1(update, context)
 
-
-# ── Step 4 — Marks type ───────────────────────────────────────────────
-
-async def get_marks_type(update: Update,
-                          context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-
-    matched = None
-    for label, val in MARKS_OPTIONS.items():
-        if label == text:
-            matched = val
-            break
-
-    if matched is None:
+    # ── Toggle lesson ──
+    clean = text.replace(SELECTED_PREFIX, "").strip()
+    if clean in all_les:
+        if clean in selected:
+            selected.remove(clean)
+        else:
+            selected.append(clean)
+        context.user_data["selected_lessons"] = selected
+        kb = _lesson_keyboard(all_les, selected)
+        n  = len(selected)
         await update.message.reply_text(
-            "⚠️ Please choose one of the options:",
-            reply_markup=_kb(list(MARKS_OPTIONS.keys()), cols=2))
-        return STATE_MARKS_TYPE
-
-    if matched == "custom":
-        await update.message.reply_text(
-            "⚙️ *Custom Marks*\n\n"
-            "Enter mark values separated by commas.\n"
-            "Example: `1,2,5`",
-            parse_mode="Markdown",
-            reply_markup=ReplyKeyboardRemove(),
+            f"{'✅' if n else '⬜'} {n} lesson(s) selected.\n"
+            f"Tap more or tap  '{DONE_LESSON}'.",
+            reply_markup=kb,
         )
-        return STATE_CUSTOM_MARKS
+        return STATE_LESSON
 
-    context.user_data["marks_filter"] = matched
-    return await _show_confirm(update, context)
+    kb = _lesson_keyboard(all_les, selected)
+    await update.message.reply_text(
+        "Please tap a lesson from the keyboard.", reply_markup=kb)
+    return STATE_LESSON
 
 
-async def get_custom_marks(update: Update,
-                            context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    try:
-        marks = [int(m.strip()) for m in text.split(",") if m.strip()]
-        valid = [m for m in marks if m in (1, 2, 3, 5)]
-        if not valid:
-            raise ValueError
-    except ValueError:
+# ── Fetch all questions for selected lessons ──────────────────────────
+
+def _fetch_all(context) -> list:
+    """Fetch all questions for selected class/subject/lessons."""
+    cls     = context.user_data["class"]
+    subj    = context.user_data["subject"]
+    lessons = context.user_data.get("selected_lessons", [])
+    all_qs  = []
+    for les in lessons:
+        qs = fetch_questions_from_firestore(cls, subj, les)
+        all_qs.extend(qs)
+    return all_qs
+
+
+# ── Step 4 — How many 1-mark? ─────────────────────────────────────────
+
+async def _ask_q1(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    all_qs  = _fetch_all(context)
+    context.user_data["all_fetched"] = all_qs
+    avail   = _get_available_count(all_qs, 1)
+    display = context.user_data.get("lesson_display", "")
+    logger.info(f"Lessons={display}  total_q={len(all_qs)}  1m_avail={avail}")
+
+    context.user_data["q1"] = 0  # default
+
+    if avail == 0:
+        # Skip — no 1-mark questions available
+        context.user_data["q1"] = 0
+        return await _ask_q2(update, context)
+
+    await update.message.reply_text(
+        f"✅ Lessons: {display}\n\n"
+        "━━━━━━━━━━━━━━━━\n"
+        f"Step 4 of 6\n\n"
+        f"1️⃣  How many 1-Mark questions?\n"
+        f"Available: {avail}",
+        reply_markup=_count_keyboard(),
+    )
+    return STATE_Q1
+
+
+async def get_q1(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text   = update.message.text.strip()
+    all_qs = context.user_data.get("all_fetched", [])
+    avail  = _get_available_count(all_qs, 1)
+    n      = _parse_count(text, avail)
+
+    if n is None:
         await update.message.reply_text(
-            "⚠️ Invalid. Enter values from 1, 2, 3, 5.\n"
-            "Example: `1,3,5`", parse_mode="Markdown")
-        return STATE_CUSTOM_MARKS
+            f"⚠️ Enter a number between 0 and {avail}.",
+            reply_markup=_count_keyboard())
+        return STATE_Q1
 
-    context.user_data["marks_filter"] = valid
+    context.user_data["q1"] = n
+    return await _ask_q2(update, context)
+
+
+# ── Step 5 — How many 2-mark? ─────────────────────────────────────────
+
+async def _ask_q2(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    all_qs = context.user_data.get("all_fetched", _fetch_all(context))
+    avail  = _get_available_count(all_qs, 2)
+
+    if avail == 0:
+        context.user_data["q2"] = 0
+        return await _ask_q3(update, context)
+
+    await update.message.reply_text(
+        "━━━━━━━━━━━━━━━━\n"
+        f"Step 5 of 6\n\n"
+        f"2️⃣  How many 2-Mark questions?\n"
+        f"Available: {avail}",
+        reply_markup=_count_keyboard(),
+    )
+    return STATE_Q2
+
+
+async def get_q2(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text   = update.message.text.strip()
+    all_qs = context.user_data.get("all_fetched", [])
+    avail  = _get_available_count(all_qs, 2)
+    n      = _parse_count(text, avail)
+
+    if n is None:
+        await update.message.reply_text(
+            f"⚠️ Enter a number between 0 and {avail}.",
+            reply_markup=_count_keyboard())
+        return STATE_Q2
+
+    context.user_data["q2"] = n
+    return await _ask_q3(update, context)
+
+
+# ── Step 5 — How many 3-mark? ─────────────────────────────────────────
+
+async def _ask_q3(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    all_qs = context.user_data.get("all_fetched", _fetch_all(context))
+    avail  = _get_available_count(all_qs, 3)
+
+    if avail == 0:
+        context.user_data["q3"] = 0
+        return await _ask_q5(update, context)
+
+    await update.message.reply_text(
+        "━━━━━━━━━━━━━━━━\n"
+        f"Step 5 of 6\n\n"
+        f"3️⃣  How many 3-Mark questions?\n"
+        f"Available: {avail}",
+        reply_markup=_count_keyboard(),
+    )
+    return STATE_Q3
+
+
+async def get_q3(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text   = update.message.text.strip()
+    all_qs = context.user_data.get("all_fetched", [])
+    avail  = _get_available_count(all_qs, 3)
+    n      = _parse_count(text, avail)
+
+    if n is None:
+        await update.message.reply_text(
+            f"⚠️ Enter a number between 0 and {avail}.",
+            reply_markup=_count_keyboard())
+        return STATE_Q3
+
+    context.user_data["q3"] = n
+    return await _ask_q5(update, context)
+
+
+# ── Step 6 — How many 5-mark? ─────────────────────────────────────────
+
+async def _ask_q5(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    all_qs = context.user_data.get("all_fetched", _fetch_all(context))
+    avail  = _get_available_count(all_qs, 5)
+
+    if avail == 0:
+        context.user_data["q5"] = 0
+        return await _show_confirm(update, context)
+
+    await update.message.reply_text(
+        "━━━━━━━━━━━━━━━━\n"
+        f"Step 6 of 6\n\n"
+        f"5️⃣  How many 5-Mark questions?\n"
+        f"Available: {avail}",
+        reply_markup=_count_keyboard(),
+    )
+    return STATE_Q5
+
+
+async def get_q5(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text   = update.message.text.strip()
+    all_qs = context.user_data.get("all_fetched", [])
+    avail  = _get_available_count(all_qs, 5)
+    n      = _parse_count(text, avail)
+
+    if n is None:
+        await update.message.reply_text(
+            f"⚠️ Enter a number between 0 and {avail}.",
+            reply_markup=_count_keyboard())
+        return STATE_Q5
+
+    context.user_data["q5"] = n
     return await _show_confirm(update, context)
+
+
+# ── Confirm ───────────────────────────────────────────────────────────
+
+def _parse_count(text: str, available: int):
+    """
+    Parse count input. Returns int or None if invalid.
+    Accepts numeric strings. 'Custom' triggers free input.
+    """
+    if text == "Custom":
+        return None   # prompt again
+    try:
+        n = int(text)
+        if 0 <= n <= available:
+            return n
+        return None
+    except ValueError:
+        return None
 
 
 async def _show_confirm(update: Update,
                          context: ContextTypes.DEFAULT_TYPE):
-    ud        = context.user_data
-    marks_str = ", ".join(str(m) for m in ud["marks_filter"])
+    ud      = context.user_data
+    q1      = ud.get("q1", 0)
+    q2      = ud.get("q2", 0)
+    q3      = ud.get("q3", 0)
+    q5      = ud.get("q5", 0)
+    display = ud.get("lesson_display", "")
+
+    if q1 + q2 + q3 + q5 == 0:
+        await update.message.reply_text(
+            "⚠️ You selected 0 questions for all marks.\n"
+            "Please enter at least 1 question.\n"
+            "Send /start to begin again.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return ConversationHandler.END
+
+    total = q1*1 + q2*2 + q3*3 + q5*5
+
     await update.message.reply_text(
         "━━━━━━━━━━━━━━━━\n"
-        "✅ *Review your request:*\n\n"
-        f"📚 Class   : *{ud['class']}*\n"
-        f"📖 Subject : *{ud['subject']}*\n"
-        f"📂 Lesson  : *{ud['lesson']}*\n"
-        f"🎯 Marks   : *{marks_str}*\n\n"
-        "━━━━━━━━━━━━━━━━\n"
-        "Shall I generate the question paper now?",
-        parse_mode="Markdown",
-        reply_markup=_kb(["✅ Yes, Generate!", "❌ Cancel"], cols=2),
+        "📋 Review your paper:\n\n"
+        f"📚 Class    : {ud['class']}\n"
+        f"📖 Subject  : {ud['subject']}\n"
+        f"📂 Lessons  : {display}\n\n"
+        f"1️⃣  1-Mark   : {q1} questions  = {q1} marks\n"
+        f"2️⃣  2-Mark   : {q2} questions  = {q2*2} marks\n"
+        f"3️⃣  3-Mark   : {q3} questions  = {q3*3} marks\n"
+        f"5️⃣  5-Mark   : {q5} questions  = {q5*5} marks\n"
+        f"━━━━━━━━━━━━━━━━\n"
+        f"📊 Total     : {q1+q2+q3+q5} questions  |  {total} marks\n\n"
+        "You will receive both PDF and Word files.\n"
+        "Generate now?",
+        reply_markup=_kb(["✅ Yes, Generate!", "❌ Cancel"],
+                          cols=2, one_time=True),
     )
     return STATE_CONFIRM
 
 
-# ── Step 5 — Generate ─────────────────────────────────────────────────
+# ── Generate & Send ───────────────────────────────────────────────────
 
 async def confirm_generate(update: Update,
                             context: ContextTypes.DEFAULT_TYPE):
@@ -290,81 +499,163 @@ async def confirm_generate(update: Update,
             reply_markup=ReplyKeyboardRemove())
         return ConversationHandler.END
 
-    ud           = context.user_data
-    class_       = ud["class"]
-    subject      = ud["subject"]
-    lesson       = ud["lesson"]
-    marks_filter = ud["marks_filter"]
-    teacher      = update.effective_user.full_name
+    ud      = context.user_data
+    class_  = ud["class"]
+    subject = ud["subject"]
+    display = ud.get("lesson_display", "")
+    q1      = ud.get("q1", 0)
+    q2      = ud.get("q2", 0)
+    q3      = ud.get("q3", 0)
+    q5      = ud.get("q5", 0)
+    teacher = update.effective_user.full_name
 
     await update.message.reply_text(
-        "⏳ Fetching questions from cloud and generating PDF...\n"
-        "Please wait a moment.",
+        "⏳ Generating PDF and Word files...\nPlease wait.",
         reply_markup=ReplyKeyboardRemove(),
     )
 
-    # Fetch from Firestore
-    all_qs   = fetch_questions_from_firestore(class_, subject, lesson)
-    filtered = [q for q in all_qs if q.get("marks") in marks_filter]
+    all_qs = ud.get("all_fetched", [])
 
-    if not filtered:
+    # ── Smart unique random picking (mirrors exam_engine.py logic) ──
+    # Tracks questions used in this session to avoid repeats
+    used_ids = ud.setdefault("used_question_ids", set())
+
+    def _safe_sample(population: list, k: int) -> list:
+        """
+        Exact copy of exam_engine safe_sample logic:
+        - Never repeats a question within this session
+        - Falls back to full pool if not enough unused questions
+        - Uses random.sample() — no in-place mutation
+        """
+        if k <= 0:
+            return []
+
+        # Prefer questions not yet used this session
+        unused = [q for q in population
+                  if q.get("question", "") not in used_ids]
+
+        if len(unused) >= k:
+            picked = random.sample(unused, k)
+        elif len(population) >= k:
+            # Not enough unused — use full pool but still randomise
+            logger.info(f"Not enough unused questions (need {k}, "
+                        f"unused={len(unused)}, total={len(population)}) "
+                        f"— using full pool")
+            picked = random.sample(population, k)
+        else:
+            # Fewer available than requested — take all
+            logger.info(f"Fewer questions than requested "
+                        f"(need {k}, have {len(population)}) — taking all")
+            picked = random.sample(population, len(population))
+
+        # Record used question texts in session
+        for q in picked:
+            used_ids.add(q.get("question", ""))
+
+        return picked
+
+    def _pick_by_marks(mark: int, count: int) -> list:
+        pool = [q for q in all_qs if q.get("marks") == mark]
+        return _safe_sample(pool, count)
+
+    def _pick_either_or(count: int) -> list:
+        """
+        5-mark Either/Or pairs — mirrors exam_engine Part D logic:
+        fetch double the count to form pairs (Qa OR Qb).
+        Returns flat list; pdf/docx generators pair them up.
+        """
+        pool = [q for q in all_qs if q.get("marks") == 5]
+        # Need count*2 questions for count pairs
+        return _safe_sample(pool, count * 2)
+
+    part_a = _pick_by_marks(1, q1)   # 1-mark: exact count
+    part_b = _pick_by_marks(2, q2)   # 2-mark: exact count
+    part_c = _pick_by_marks(3, q3)   # 3-mark: exact count
+    part_d = _pick_either_or(q5)     # 5-mark: double for Either/Or pairs
+
+    logger.info(f"Picked: 1M={len(part_a)} 2M={len(part_b)} "
+                f"3M={len(part_c)} 5M_pool={len(part_d)} pairs={len(part_d)//2}")
+
+    # Combine for generators (part_d passed separately for Either/Or layout)
+    final = part_a + part_b + part_c + part_d
+
+    if not final:
         await update.message.reply_text(
-            f"⚠️ No questions found for:\n"
-            f"Class {class_} → {subject} → {lesson}\n"
-            f"Marks: {marks_filter}\n\n"
-            "Please ask your admin to upload questions.\n"
-            "Send /start to try again."
-        )
+            "⚠️ No questions available. "
+            "Ask admin to sync questions to Firebase.\n"
+            "Send /start to retry.")
         return ConversationHandler.END
 
-    random.shuffle(filtered)
+    actual_q5_pairs = len(part_d) // 2
+    total_marks = (len(part_a)*1 + len(part_b)*2 +
+                   len(part_c)*3 + actual_q5_pairs*5)
 
-    # Generate PDF
+    # ── Generate PDF ──
     pdf_path = generate_question_paper_pdf(
-        class_, subject, lesson, filtered,
+        class_, subject, display, final,
         teacher_name=teacher,
-    )
+        part_d=part_d)
 
-    if not pdf_path or not os.path.exists(pdf_path):
-        await update.message.reply_text(
-            "❌ PDF generation failed. Please contact your admin.")
-        return ConversationHandler.END
+    # ── Generate DOCX ──
+    docx_path = generate_question_paper_docx(
+        class_, subject, display, final,
+        teacher_name=teacher,
+        part_d=part_d)
 
-    # Save paper record to Firestore
+    # ── Save to Firestore ──
     save_generated_paper(
-        class_, subject, lesson, teacher,
+        class_, subject, display, teacher,
         [{"question": q["question"], "marks": q["marks"]}
-         for q in filtered],
+         for q in final],
     )
 
-    # Send PDF via Telegram
-    total_marks = sum(q.get("marks", 1) for q in filtered)
+    actual_pairs_display = actual_q5_pairs if actual_q5_pairs > 0 else 0
+    total_q_display = len(part_a) + len(part_b) + len(part_c) + actual_pairs_display
+
     caption = (
-        f"📄 *Question Paper Generated*\n\n"
-        f"📚 Class    : {class_}\n"
-        f"📖 Subject  : {subject}\n"
-        f"📂 Lesson   : {lesson}\n"
-        f"📊 Questions: {len(filtered)}  |  Total: {total_marks} marks\n"
-        f"👩‍🏫 Teacher  : {teacher}\n"
-        f"🕐 Time     : {datetime.now().strftime('%d-%m-%Y %I:%M %p')}"
+        f"📄 Question Paper\n\n"
+        f"Class    : {class_}\n"
+        f"Subject  : {subject}\n"
+        f"Lessons  : {display}\n"
+        f"1M = {len(part_a)} Qs  |  "
+        f"2M = {len(part_b)} Qs  |  "
+        f"3M = {len(part_c)} Qs  |  "
+        f"5M = {actual_pairs_display} pairs\n"
+        f"Total    : {total_q_display} questions  |  {total_marks} marks\n"
+        f"Time     : {datetime.now().strftime('%d-%m-%Y %I:%M %p')}"
     )
 
-    with open(pdf_path, "rb") as pdf_file:
-        await update.message.reply_document(
-            document=pdf_file,
-            filename=os.path.basename(pdf_path),
-            caption=caption,
-            parse_mode="Markdown",
-        )
+    # ── Send PDF ──
+    if pdf_path and os.path.exists(pdf_path):
+        with open(pdf_path, "rb") as f:
+            await update.message.reply_document(
+                document=f,
+                filename=os.path.basename(pdf_path),
+                caption=caption + "\n\n📕 PDF Version",
+            )
+    else:
+        await update.message.reply_text("⚠️ PDF generation failed.")
+
+    # ── Send DOCX ──
+    if docx_path and os.path.exists(docx_path):
+        with open(docx_path, "rb") as f:
+            await update.message.reply_document(
+                document=f,
+                filename=os.path.basename(docx_path),
+                caption="📘 Word (.docx) Version — Edit as needed",
+            )
+    else:
+        await update.message.reply_text("⚠️ Word file generation failed.")
 
     await update.message.reply_text(
-        "✅ Paper sent! Send /start to generate another.",
+        "✅ Done! Both files sent successfully.\n"
+        "Send /start to generate another paper.",
         reply_markup=ReplyKeyboardRemove(),
     )
     return ConversationHandler.END
 
 
-# ── /cancel ───────────────────────────────────────────────────────────
+# ── /cancel & /help ───────────────────────────────────────────────────
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -373,30 +664,27 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-# ── /help ─────────────────────────────────────────────────────────────
-
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = str(update.effective_chat.id)
-    print(f"[Bot] /help from {update.effective_user.full_name}  |  Chat ID: {chat_id}")
-
-    if not is_approved_user(chat_id):
-        await update.message.reply_text(
-            _access_denied(), parse_mode="Markdown")
+    if not is_approved_user(str(update.effective_chat.id)):
+        await update.message.reply_text(_access_denied())
         return
-
     await update.message.reply_text(
-        "📖 *TN Exam Bot — Help*\n\n"
+        "📖 TN Exam Bot — Help\n\n"
         "Commands:\n"
         "  /start  — Generate a question paper\n"
         "  /cancel — Cancel current operation\n"
         "  /help   — Show this message\n\n"
         "Steps:\n"
-        "  1️⃣  Enter Class\n"
-        "  2️⃣  Select Subject\n"
-        "  3️⃣  Select Lesson\n"
-        "  4️⃣  Choose Marks type\n"
-        "  5️⃣  Confirm → PDF sent to you!",
-        parse_mode="Markdown",
+        "  1. Enter Class\n"
+        "  2. Select Subject\n"
+        "  3. Select one or more Lessons\n"
+        "  4. How many 1-mark questions?\n"
+        "  5. How many 2-mark questions?\n"
+        "  6. How many 3-mark questions?\n"
+        "  7. How many 5-mark questions?\n"
+        "  8. Confirm → PDF + Word sent!\n\n"
+        "Tip: If no questions available for a mark,\n"
+        "that step is skipped automatically."
     )
 
 
@@ -404,21 +692,23 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     if TELEGRAM_BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
-        print("❌  ERROR: Set your TELEGRAM_BOT_TOKEN in config.py "
-              "or as an environment variable before running!")
+        print("ERROR: Set TELEGRAM_BOT_TOKEN!")
         return
 
+    logger.info("Starting TN Exam Bot...")
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
-            STATE_CLASS:        [MessageHandler(filters.TEXT & ~filters.COMMAND, get_class)],
-            STATE_SUBJECT:      [MessageHandler(filters.TEXT & ~filters.COMMAND, get_subject)],
-            STATE_LESSON:       [MessageHandler(filters.TEXT & ~filters.COMMAND, get_lesson)],
-            STATE_MARKS_TYPE:   [MessageHandler(filters.TEXT & ~filters.COMMAND, get_marks_type)],
-            STATE_CUSTOM_MARKS: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_custom_marks)],
-            STATE_CONFIRM:      [MessageHandler(filters.TEXT & ~filters.COMMAND, confirm_generate)],
+            STATE_CLASS:    [MessageHandler(filters.TEXT & ~filters.COMMAND, get_class)],
+            STATE_SUBJECT:  [MessageHandler(filters.TEXT & ~filters.COMMAND, get_subject)],
+            STATE_LESSON:   [MessageHandler(filters.TEXT & ~filters.COMMAND, get_lesson)],
+            STATE_Q1:       [MessageHandler(filters.TEXT & ~filters.COMMAND, get_q1)],
+            STATE_Q2:       [MessageHandler(filters.TEXT & ~filters.COMMAND, get_q2)],
+            STATE_Q3:       [MessageHandler(filters.TEXT & ~filters.COMMAND, get_q3)],
+            STATE_Q5:       [MessageHandler(filters.TEXT & ~filters.COMMAND, get_q5)],
+            STATE_CONFIRM:  [MessageHandler(filters.TEXT & ~filters.COMMAND, confirm_generate)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
@@ -426,8 +716,7 @@ def main():
     app.add_handler(conv)
     app.add_handler(CommandHandler("help", help_cmd))
 
-    print("🤖 TN Exam Bot is running...")
-    print("   Press Ctrl+C to stop.\n")
+    print("TN Exam Bot is running...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
