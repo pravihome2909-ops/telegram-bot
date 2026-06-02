@@ -35,9 +35,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ── Conversation states ───────────────────────────────────────────────
-(STATE_CLASS, STATE_SUBJECT, STATE_LESSON,
+(STATE_TEST_NAME, STATE_SCHOOL_NAME,
+ STATE_CLASS, STATE_SUBJECT, STATE_LESSON,
  STATE_Q1, STATE_Q2, STATE_Q3, STATE_Q5,
- STATE_CONFIRM) = range(8)
+ STATE_CONFIRM) = range(10)
 
 # Lesson keyboard constants
 SELECTED_PREFIX = "✅ "
@@ -128,14 +129,49 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"👋 Welcome, {name}!\n\n"
         "📝 Let's generate a question paper step by step.\n\n"
         "━━━━━━━━━━━━━━━━\n"
-        "📚 Step 1 of 6\n"
+        "📋 Step 1 of 8\n"
+        "Enter the Test Name\n"
+        "(e.g. Unit Test 1, Mid Term, Quarterly)\n"
+        "Or type  skip  to leave blank:",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return STATE_TEST_NAME
+
+
+# ── Step 1 — Test Name ───────────────────────────────────────────────
+
+async def get_test_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    context.user_data["test_name"] = "" if text.lower() == "skip" else text
+
+    await update.message.reply_text(
+        f"✅ Test: {context.user_data['test_name'] or '(none)'}\n\n"
+        "━━━━━━━━━━━━━━━━\n"
+        "🏫 Step 2 of 8\n"
+        "Enter the School Name\n"
+        "Or type  skip  to leave blank:",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return STATE_SCHOOL_NAME
+
+
+# ── Step 2 — School Name ──────────────────────────────────────────────
+
+async def get_school_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    context.user_data["school_name"] = "" if text.lower() == "skip" else text
+
+    await update.message.reply_text(
+        f"✅ School: {context.user_data['school_name'] or '(none)'}\n\n"
+        "━━━━━━━━━━━━━━━━\n"
+        "📚 Step 3 of 8\n"
         "Enter the Class (e.g. 10):",
         reply_markup=ReplyKeyboardRemove(),
     )
     return STATE_CLASS
 
 
-# ── Step 1 — Class ────────────────────────────────────────────────────
+# ── Step 3 — Class ────────────────────────────────────────────────────
 
 async def get_class(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
@@ -239,6 +275,10 @@ async def get_lesson(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return STATE_LESSON
         context.user_data["lesson_display"] = ", ".join(selected)
+        # Pre-fetch questions NOW in background while teacher reads next screen
+        import asyncio
+        loop = asyncio.get_event_loop()
+        loop.run_in_executor(None, lambda: _prefetch_and_store(context))
         return await _ask_q1(update, context)
 
     # ── Toggle lesson ──
@@ -266,22 +306,46 @@ async def get_lesson(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── Fetch all questions for selected lessons ──────────────────────────
 
+def _prefetch_and_store(context):
+    """Background pre-fetch — runs while teacher is reading the marks screen."""
+    if context.user_data.get("all_fetched"):
+        return   # already fetched
+    try:
+        qs = _fetch_all(context)
+        context.user_data["all_fetched"] = qs
+        logger.info(f"Pre-fetch complete: {len(qs)} questions cached")
+    except Exception as e:
+        logger.error(f"Pre-fetch error: {e}")
+
+
 def _fetch_all(context) -> list:
-    """Fetch all questions for selected class/subject/lessons."""
-    cls     = context.user_data["class"]
-    subj    = context.user_data["subject"]
-    lessons = context.user_data.get("selected_lessons", [])
-    all_qs  = []
-    for les in lessons:
-        qs = fetch_questions_from_firestore(cls, subj, les)
-        all_qs.extend(qs)
+    """
+    Fetch questions in ONE Firestore call (fetch entire subject),
+    then filter locally by selected lessons.
+    Much faster than one call per lesson.
+    """
+    cls      = context.user_data["class"]
+    subj     = context.user_data["subject"]
+    lessons  = set(context.user_data.get("selected_lessons", []))
+
+    # Single Firestore call — no lesson filter (fetch all for subject)
+    all_qs = fetch_questions_from_firestore(cls, subj)
+
+    # Filter locally by selected lessons
+    if lessons:
+        all_qs = [q for q in all_qs
+                  if q.get("lesson", "") in lessons]
+
+    logger.info(f"Fetched {len(all_qs)} questions in 1 Firestore call "
+                f"(lessons: {lessons})")
     return all_qs
 
 
 # ── Step 4 — How many 1-mark? ─────────────────────────────────────────
 
 async def _ask_q1(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    all_qs  = _fetch_all(context)
+    # Use pre-fetched data if available, otherwise fetch now
+    all_qs = context.user_data.get("all_fetched") or _fetch_all(context)
     context.user_data["all_fetched"] = all_qs
     avail   = _get_available_count(all_qs, 1)
     display = context.user_data.get("lesson_display", "")
@@ -467,18 +531,33 @@ async def _show_confirm(update: Update,
 
     total = q1*1 + q2*2 + q3*3 + q5*5
 
+    # Correct marks using TN board pattern
+    m1_score = q1 * 1
+    m2_score = min(q2, 7) * 2
+    m3_score = min(q3, 7) * 3
+    m5_score = q5 * 5
+    total    = m1_score + m2_score + m3_score + m5_score
+
+    test_nm   = ud.get("test_name",   "")
+    school_nm = ud.get("school_name", "")
+    hdr_line  = ""
+    if test_nm or school_nm:
+        hdr_line = (f"📋 Test    : {test_nm or '—'}\n"
+                    f"🏫 School  : {school_nm or '—'}\n")
+
     await update.message.reply_text(
         "━━━━━━━━━━━━━━━━\n"
-        "📋 Review your paper:\n\n"
+        "📝 Review your paper:\n\n"
+        + hdr_line +
         f"📚 Class    : {ud['class']}\n"
         f"📖 Subject  : {ud['subject']}\n"
         f"📂 Lessons  : {display}\n\n"
-        f"1️⃣  1-Mark   : {q1} questions  = {q1} marks\n"
-        f"2️⃣  2-Mark   : {q2} questions  = {q2*2} marks\n"
-        f"3️⃣  3-Mark   : {q3} questions  = {q3*3} marks\n"
-        f"5️⃣  5-Mark   : {q5} questions  = {q5*5} marks\n"
+        f"1️⃣  1-Mark   : {q1} Qs  × 1  = {m1_score} marks\n"
+        f"2️⃣  2-Mark   : {q2} Qs  (ans 7) × 2  = {m2_score} marks\n"
+        f"3️⃣  3-Mark   : {q3} Qs  (ans 7) × 3  = {m3_score} marks\n"
+        f"5️⃣  5-Mark   : {q5} pairs × 5  = {m5_score} marks\n"
         f"━━━━━━━━━━━━━━━━\n"
-        f"📊 Total     : {q1+q2+q3+q5} questions  |  {total} marks\n\n"
+        f"📊 Total     : {total} marks\n\n"
         "You will receive both PDF and Word files.\n"
         "Generate now?",
         reply_markup=_kb(["✅ Yes, Generate!", "❌ Cancel"],
@@ -587,20 +666,44 @@ async def confirm_generate(update: Update,
         return ConversationHandler.END
 
     actual_q5_pairs = len(part_d) // 2
-    total_marks = (len(part_a)*1 + len(part_b)*2 +
-                   len(part_c)*3 + actual_q5_pairs*5)
 
-    # ── Generate PDF ──
-    pdf_path = generate_question_paper_pdf(
-        class_, subject, display, final,
-        teacher_name=teacher,
-        part_d=part_d)
+    # TN board pattern: 2-mark → students answer 7 only, 3-mark → students answer 7 only
+    def _scored(mark, count):
+        if mark == 1:  return count * 1
+        elif mark == 2: return min(count, 7) * 2
+        elif mark == 3: return min(count, 7) * 3
+        elif mark == 5: return actual_q5_pairs * 5
+        return count * mark
 
-    # ── Generate DOCX ──
-    docx_path = generate_question_paper_docx(
-        class_, subject, display, final,
-        teacher_name=teacher,
-        part_d=part_d)
+    total_marks = (_scored(1, len(part_a)) + _scored(2, len(part_b)) +
+                   _scored(3, len(part_c)) + actual_q5_pairs * 5)
+
+    test_name   = ud.get("test_name",   "")
+    school_name = ud.get("school_name", "")
+
+    # ── Generate PDF + DOCX in parallel (2x faster) ──
+    import asyncio
+    import concurrent.futures
+
+    loop = asyncio.get_event_loop()
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+
+    pdf_future  = loop.run_in_executor(
+        executor,
+        lambda: generate_question_paper_pdf(
+            class_, subject, display, final,
+            teacher_name=teacher, part_d=part_d,
+            test_name=test_name, school_name=school_name))
+
+    docx_future = loop.run_in_executor(
+        executor,
+        lambda: generate_question_paper_docx(
+            class_, subject, display, final,
+            teacher_name=teacher, part_d=part_d,
+            test_name=test_name, school_name=school_name))
+
+    # Wait for both to finish simultaneously
+    pdf_path, docx_path = await asyncio.gather(pdf_future, docx_future)
 
     # ── Save to Firestore ──
     save_generated_paper(
@@ -701,7 +804,9 @@ def main():
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
-            STATE_CLASS:    [MessageHandler(filters.TEXT & ~filters.COMMAND, get_class)],
+            STATE_TEST_NAME:   [MessageHandler(filters.TEXT & ~filters.COMMAND, get_test_name)],
+            STATE_SCHOOL_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_school_name)],
+            STATE_CLASS:       [MessageHandler(filters.TEXT & ~filters.COMMAND, get_class)],
             STATE_SUBJECT:  [MessageHandler(filters.TEXT & ~filters.COMMAND, get_subject)],
             STATE_LESSON:   [MessageHandler(filters.TEXT & ~filters.COMMAND, get_lesson)],
             STATE_Q1:       [MessageHandler(filters.TEXT & ~filters.COMMAND, get_q1)],
