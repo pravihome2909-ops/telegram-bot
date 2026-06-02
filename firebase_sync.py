@@ -150,24 +150,29 @@ def fetch_questions_from_firestore(class_: str, subject: str,
                                     lesson: str = None) -> list:
     """
     Fetch questions from Firestore for a class+subject.
-    Optionally filter by lesson name.
+    Fetches ALL questions in one stream — filter by lesson locally.
     Returns list of dicts.
     """
     db = get_db()
     if db is None:
         return []
     try:
-        doc_id = f"class{class_}_{subject.replace(' ', '_')}"
-        items  = (db.collection(FIRESTORE_QUESTIONS_COLLECTION)
-                    .document(doc_id)
-                    .collection("items")
-                    .stream())
-        results = []
-        for doc in items:
-            data = doc.to_dict()
-            if lesson and data.get("lesson", "").lower() != lesson.lower():
-                continue
-            results.append(data)
+        doc_id   = f"class{class_}_{subject.replace(' ', '_')}"
+        # Single stream call — no per-lesson round trips
+        items    = (db.collection(FIRESTORE_QUESTIONS_COLLECTION)
+                      .document(doc_id)
+                      .collection("items")
+                      .stream())
+
+        # Read all into memory at once
+        results = [doc.to_dict() for doc in items]
+
+        # Filter locally if lesson specified (much faster than Firestore where clause)
+        if lesson:
+            lesson_lower = lesson.lower()
+            results = [q for q in results
+                       if q.get("lesson", "").lower() == lesson_lower]
+
         return results
     except Exception as e:
         print(f"[Firebase] Fetch error: {e}")
