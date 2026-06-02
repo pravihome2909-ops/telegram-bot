@@ -99,7 +99,9 @@ class _WatermarkCanvas(pdfcanvas.Canvas):
 def generate_question_paper_pdf(class_: str, subject: str, lesson: str,
                                   questions: list, teacher_name: str = "",
                                   output_path: str = None,
-                                  part_d: list = None) -> str:
+                                  part_d: list = None,
+                                  test_name: str = "",
+                                  school_name: str = "") -> str:
     if output_path is None:
         os.makedirs("generated_papers", exist_ok=True)
         ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -115,7 +117,7 @@ def generate_question_paper_pdf(class_: str, subject: str, lesson: str,
 
     font = _register_font()
 
-    # Page margins: Left=-2cm Right=-2cm Top=1.9cm Bottom=1.9cm
+    # Page margins: Left=2cm Right=2cm Top=1.9cm Bottom=1.9cm
     # (0.75 inch ≈ 1.905 cm)
     doc = SimpleDocTemplate(
         output_path,
@@ -142,9 +144,38 @@ def generate_question_paper_pdf(class_: str, subject: str, lesson: str,
 
     story = []
 
-    # ── Header: Class | Lessons | Total Marks ────────────────────────
-    total_marks = sum(q.get("marks", 1) for q in questions)
+    # ── Compute correct marks (TN board pattern) ─────────────────────
+    part_d_qs = part_d if part_d else []
+    other_qs  = [q for q in questions if q.get("marks") != 5]
+    groups_hdr = {}
+    for q in other_qs:
+        groups_hdr.setdefault(q.get("marks", 1), []).append(q)
+    actual_pairs = len(part_d_qs) // 2
 
+    def _score(mark, count):
+        if mark == 1:  return count * 1
+        elif mark == 2: return min(count, 7) * 2
+        elif mark == 3: return min(count, 7) * 3
+        return count * mark
+
+    total_marks = (
+        _score(1, len(groups_hdr.get(1, []))) +
+        _score(2, len(groups_hdr.get(2, []))) +
+        _score(3, len(groups_hdr.get(3, []))) +
+        actual_pairs * 5
+    )
+
+    # ── Title block: Test Name + School Name ──────────────────────────
+    if test_name or school_name:
+        top_text = test_name if test_name else "QUESTION PAPER"
+        if school_name:
+            top_text = f"{school_name}  —  {top_text}"
+        story.append(Paragraph(
+            top_text.upper(),
+            _style("toptitle", 13, align=TA_CENTER,
+                   color="#1a3a5c", space_after=4)))
+
+    # ── Header: Class | Lessons | Total Marks ─────────────────────────
     hdr_data = [[
         Paragraph(f"<b>Class : {class_}</b>",
                   _style("h1", 10, color="#000000")),
@@ -165,13 +196,34 @@ def generate_question_paper_pdf(class_: str, subject: str, lesson: str,
          0.8, colors.HexColor("#1a3a5c")),
     ]))
     story.append(hdr_table)
-    story.append(Spacer(1, 10))
+
+    # Marks breakdown line  20×1=20  |  10×2=14  |  ...
+    breakdown = []
+    if 1 in groups_hdr and groups_hdr[1]:
+        n = len(groups_hdr[1])
+        breakdown.append(f"{n}x1={n}")
+    if 2 in groups_hdr and groups_hdr[2]:
+        n = len(groups_hdr[2])
+        breakdown.append(f"{n}x2={_score(2,n)}")
+    if 3 in groups_hdr and groups_hdr[3]:
+        n = len(groups_hdr[3])
+        breakdown.append(f"{n}x3={_score(3,n)}")
+    if actual_pairs > 0:
+        breakdown.append(f"{actual_pairs}x5={actual_pairs*5}")
+    if breakdown:
+        story.append(Paragraph(
+            "  |  ".join(breakdown) + f"  =  {total_marks} Marks",
+            _style("bd", 9, align=TA_CENTER,
+                   color="#444444", space_after=6)))
+
+    story.append(Spacer(1, 6))
 
     # ── Title ─────────────────────────────────────────────────────────
-    story.append(Paragraph(
-        "QUESTION PAPER",
-        _style("title", 13, align=TA_CENTER,
-               color="#1a3a5c", space_after=10)))
+    if not test_name:
+        story.append(Paragraph(
+            "QUESTION PAPER",
+            _style("title", 13, align=TA_CENTER,
+                   color="#1a3a5c", space_after=10)))
 
     # ── Sections ──────────────────────────────────────────────────────
     SECTION_LABELS = {
