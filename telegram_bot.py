@@ -11,13 +11,16 @@ import logging
 import random
 from datetime import datetime
 
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram import (Update, ReplyKeyboardMarkup, ReplyKeyboardRemove,
+                      InlineKeyboardMarkup, InlineKeyboardButton)
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     ConversationHandler, ContextTypes, filters,
+    CallbackQueryHandler,
 )
 
-from config import TELEGRAM_BOT_TOKEN
+from config import TELEGRAM_BOT_TOKEN, ADMIN_CHAT_ID
+from usage_logger import log_paper_generation
 from firebase_sync import (
     is_approved_user,
     fetch_questions_from_firestore,
@@ -25,8 +28,12 @@ from firebase_sync import (
     get_db,
     FIRESTORE_QUESTIONS_COLLECTION,
 )
-from pdf_generator  import generate_question_paper_pdf
-from docx_generator import generate_question_paper_docx
+from pdf_generator  import (generate_question_paper_pdf,
+                             generate_answer_key_pdf,
+                             get_next_question_number,
+                             save_next_question_number)
+from docx_generator import (generate_question_paper_docx,
+                              generate_answer_key_docx)
 
 logging.basicConfig(
     format="%(asctime)s — %(levelname)s — %(message)s",
@@ -113,6 +120,260 @@ def _count_keyboard() -> ReplyKeyboardMarkup:
     return _kb(COUNT_BUTTONS, cols=3, one_time=True)
 
 
+# ── Admin approval helpers ────────────────────────────────────────────
+
+async def _notify_admin_for_approval(update: Update,
+                                      context: ContextTypes.DEFAULT_TYPE):
+    """Send approval request to admin with Approve/Reject inline buttons."""
+    if not ADMIN_CHAT_ID:
+        return   # admin chat ID not configured
+
+    user      = update.effective_user
+    chat_id   = str(update.effective_chat.id)
+    full_name = user.full_name
+    username  = f"@{user.username}" if user.username else "no username"
+
+    # Check if already pending (don't spam admin)
+    try:
+        db  = get_db()
+        if db:
+            pending = (db.collection("approval_requests")
+                         .document(chat_id).get())
+            if pending.exists:
+                return   # already sent request before
+            # Save pending request
+            db.collection("approval_requests").document(chat_id).set({
+                "chat_id":   chat_id,
+                "name":      full_name,
+                "username":  username,
+                "status":    "pending",
+            })
+    except Exception as e:
+        logger.error(f"Approval request save error: {e}")
+
+    # Build inline keyboard
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "✅ Approve",
+            callback_data=f"approve:{chat_id}:{full_name}"),
+        InlineKeyboardButton(
+            "❌ Reject",
+            callback_data=f"reject:{chat_id}:{full_name}"),
+    ]])
+
+    msg = (
+        "🔔 New Teacher Access Request\n\n"
+        f"👤 Name     : {full_name}\n"
+        f"🆔 Username : {username}\n"
+        f"📱 Chat ID  : {chat_id}\n\n"
+        "Tap Approve or Reject below:"
+    )
+
+    try:
+        await context.bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text=msg,
+            reply_markup=keyboard,
+        )
+        logger.info(f"Approval request sent to admin for {full_name} ({chat_id})")
+    except Exception as e:
+        logger.error(f"Could not notify admin: {e}")
+
+
+async def handle_approval_callback(update: Update,
+                                    context: ContextTypes.DEFAULT_TYPE):
+    """Handle admin tapping Approve or Reject button."""
+    query = update.callback_query
+    await query.answer()
+
+    data        = query.data          # "approve:CHAT_ID:NAME" or "reject:..."
+    parts       = data.split(":", 2)
+    action      = parts[0]            # approve / reject
+    teacher_id  = parts[1]            # teacher's chat ID
+    teacher_name = parts[2] if len(parts) > 2 else "Teacher"
+
+    if action == "approve":
+        # Add to approved users in Firestore
+        try:
+            fn = None
+            try:
+                from firebase_sync import add_approved_telegram_user
+                fn = add_approved_telegram_user
+            except Exception:
+                pass
+
+            if fn:
+                fn(teacher_id, teacher_name)
+
+            # Update request status
+            db = get_db()
+            if db:
+                db.collection("approval_requests").document(teacher_id).update(
+                    {"status": "approved"})
+
+        except Exception as e:
+            logger.error(f"Approve error: {e}")
+            await query.edit_message_text(
+                query.message.text + "\n\n❌ Error: " + str(e))
+            return
+
+        # Update admin message
+        await query.edit_message_text(
+            query.message.text +
+            f"\n\n✅ Approved by {update.effective_user.first_name}!")
+
+        # Notify teacher
+        try:
+            await context.bot.send_message(
+                chat_id=teacher_id,
+                text=(
+                    "✅ Your access has been approved!\n\n"
+                    "Send /start to generate question papers."
+                ),
+            )
+        except Exception as e:
+            logger.error(f"Could not notify teacher: {e}")
+
+    elif action == "reject":
+        # Update request status
+        try:
+            db = get_db()
+            if db:
+                db.collection("approval_requests").document(teacher_id).update(
+                    {"status": "rejected"})
+        except Exception as e:
+            logger.error(f"Reject update error: {e}")
+
+        # Update admin message
+        await query.edit_message_text(
+            query.message.text +
+            f"\n\n❌ Rejected by {update.effective_user.first_name}.")
+
+        # Notify teacher
+        try:
+            await context.bot.send_message(
+                chat_id=teacher_id,
+                text=(
+                    "❌ Your access request was not approved.\n"
+                    "Please contact your school admin."
+                ),
+            )
+        except Exception as e:
+            logger.error(f"Could not notify teacher rejection: {e}")
+
+
+async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /pending — Admin command to list all pending approval requests.
+    Only works for ADMIN_CHAT_ID.
+    """
+    chat_id = str(update.effective_chat.id)
+    if ADMIN_CHAT_ID and chat_id != str(ADMIN_CHAT_ID):
+        await update.message.reply_text("⛔ Admin only command.")
+        return
+
+    try:
+        db = get_db()
+        if db is None:
+            await update.message.reply_text("Firebase not connected.")
+            return
+
+        docs = (db.collection("approval_requests")
+                  .where("status", "==", "pending")
+                  .stream())
+        pending = [d.to_dict() for d in docs]
+    except Exception as e:
+        await update.message.reply_text("Error: " + str(e))
+        return
+
+    if not pending:
+        await update.message.reply_text(
+            "✅ No pending approval requests.")
+        return
+
+    for req in pending:
+        tid   = req.get("chat_id",  "")
+        tname = req.get("name",     "Unknown")
+        tusr  = req.get("username", "")
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                "✅ Approve",
+                callback_data=f"approve:{tid}:{tname}"),
+            InlineKeyboardButton(
+                "❌ Reject",
+                callback_data=f"reject:{tid}:{tname}"),
+        ]])
+        await update.message.reply_text(
+            f"👤 {tname}  ({tusr})\nChat ID: {tid}",
+            reply_markup=keyboard,
+        )
+
+
+async def cmd_approved_list(update: Update,
+                             context: ContextTypes.DEFAULT_TYPE):
+    """
+    /approved — Admin command to list all approved teachers.
+    """
+    chat_id = str(update.effective_chat.id)
+    if ADMIN_CHAT_ID and chat_id != str(ADMIN_CHAT_ID):
+        await update.message.reply_text("⛔ Admin only command.")
+        return
+
+    try:
+        from firebase_sync import get_approved_telegram_users
+        users = get_approved_telegram_users()
+    except Exception as e:
+        await update.message.reply_text("Error: " + str(e))
+        return
+
+    if not users:
+        await update.message.reply_text("No approved teachers yet.")
+        return
+
+    lines = ["✅ Approved Teachers:\n"]
+    for i, u in enumerate(users, 1):
+        lines.append(
+            f"{i}. {u.get('name','')}  |  "
+            f"ID: {u.get('chat_id','')}")
+
+    await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /remove CHAT_ID — Admin removes a teacher's access.
+    """
+    chat_id = str(update.effective_chat.id)
+    if ADMIN_CHAT_ID and chat_id != str(ADMIN_CHAT_ID):
+        await update.message.reply_text("⛔ Admin only command.")
+        return
+
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "Usage: /remove CHAT_ID\nExample: /remove 123456789")
+        return
+
+    target_id = args[0].strip()
+    try:
+        from firebase_sync import remove_approved_telegram_user
+        ok = remove_approved_telegram_user(target_id)
+        if ok:
+            await update.message.reply_text(
+                f"✅ Removed teacher {target_id} from approved list.")
+            try:
+                await context.bot.send_message(
+                    chat_id=target_id,
+                    text="❌ Your bot access has been removed by admin.")
+            except Exception:
+                pass
+        else:
+            await update.message.reply_text(
+                f"❌ Could not remove {target_id}.")
+    except Exception as e:
+        await update.message.reply_text("Error: " + str(e))
+
+
 # ── /start ────────────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -121,7 +382,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"/start  {name}  {chat_id}")
 
     if not is_approved_user(chat_id):
-        await update.message.reply_text(_access_denied())
+        # Notify admin with Approve/Reject buttons
+        await _notify_admin_for_approval(update, context)
+        await update.message.reply_text(
+            "⏳ Your access request has been sent to the admin.\n\n"
+            "You will be notified once approved.\n"
+            "Send /start again after approval.",
+        )
         return ConversationHandler.END
 
     context.user_data.clear()
@@ -347,6 +614,16 @@ async def _ask_q1(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Use pre-fetched data if available, otherwise fetch now
     all_qs = context.user_data.get("all_fetched") or _fetch_all(context)
     context.user_data["all_fetched"] = all_qs
+
+    # Load cross-session used questions (Feature 3)
+    if not context.user_data.get("used_question_ids"):
+        cls  = context.user_data.get("class","")
+        subj = context.user_data.get("subject","")
+        chat = str(update.effective_chat.id)
+        prev_used = _load_used_questions(chat, cls, subj)
+        context.user_data["used_question_ids"] = prev_used
+        if prev_used:
+            logger.info(f"Loaded {len(prev_used)} previously used questions")
     avail   = _get_available_count(all_qs, 1)
     display = context.user_data.get("lesson_display", "")
     logger.info(f"Lessons={display}  total_q={len(all_qs)}  1m_avail={avail}")
@@ -587,6 +864,17 @@ async def confirm_generate(update: Update,
     q3      = ud.get("q3", 0)
     q5      = ud.get("q5", 0)
     teacher = update.effective_user.full_name
+    chat_id = str(update.effective_chat.id)
+
+    # ── Numbering continuity (Feature 2) ──
+    start_number = get_next_question_number(chat_id, class_, subject)
+    if start_number > 1:
+        await update.message.reply_text(
+            f"ℹ️ Continuing from Question No. {start_number}\n"
+            f"(Previous papers: {start_number-1} questions used)\n"
+            f"Send /reset_numbers to restart from Q.1",
+            reply_markup=ReplyKeyboardRemove(),
+        )
 
     await update.message.reply_text(
         "⏳ Generating PDF and Word files...\nPlease wait.",
@@ -712,6 +1000,20 @@ async def confirm_generate(update: Update,
          for q in final],
     )
 
+    # ── Log usage to Excel + Drive ──
+    log_paper_generation(
+        teacher_name = teacher,
+        chat_id      = str(update.effective_chat.id),
+        class_       = class_,
+        subject      = subject,
+        lessons      = display,
+        q1           = len(part_a),
+        q2           = len(part_b),
+        q3           = len(part_c),
+        q5_pairs     = actual_q5_pairs,
+        total_marks  = total_marks,
+    )
+
     actual_pairs_display = actual_q5_pairs if actual_q5_pairs > 0 else 0
     total_q_display = len(part_a) + len(part_b) + len(part_c) + actual_pairs_display
 
@@ -758,6 +1060,43 @@ async def confirm_generate(update: Update,
     return ConversationHandler.END
 
 
+# ── Cross-session deduplication helpers ──────────────────────────────
+
+def _save_used_questions(chat_id: str, class_: str,
+                          subject: str, used_ids: set):
+    """Save used question texts to Firestore for cross-session dedup."""
+    if not used_ids:
+        return
+    try:
+        db = get_db()
+        if db is None:
+            return
+        key = f"{chat_id}_{class_}_{subject.replace(' ','_')}"
+        doc_ref = db.collection("used_questions").document(key)
+        existing = doc_ref.get()
+        prev = set(existing.to_dict().get("questions", []))                if existing.exists else set()
+        combined = list(prev | used_ids)[:500]  # cap at 500
+        doc_ref.set({"questions": combined}, merge=True)
+    except Exception as e:
+        logger.error(f"Save used questions error: {e}")
+
+
+def _load_used_questions(chat_id: str, class_: str,
+                          subject: str) -> set:
+    """Load previously used question texts from Firestore."""
+    try:
+        db = get_db()
+        if db is None:
+            return set()
+        key = f"{chat_id}_{class_}_{subject.replace(' ','_')}"
+        doc = db.collection("used_questions").document(key).get()
+        if doc.exists:
+            return set(doc.to_dict().get("questions", []))
+        return set()
+    except Exception:
+        return set()
+
+
 # ── /cancel & /help ───────────────────────────────────────────────────
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -793,6 +1132,123 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── Main ──────────────────────────────────────────────────────────────
 
+async def cmd_reset_numbers(update: Update,
+                             context: ContextTypes.DEFAULT_TYPE):
+    """/reset_numbers — Reset question numbering to 1 for current class+subject."""
+    chat_id = str(update.effective_chat.id)
+    if not is_approved_user(chat_id):
+        await update.message.reply_text(_access_denied())
+        return
+    # Ask which class+subject to reset
+    await update.message.reply_text(
+        "🔄 Reset Question Numbering\n\n"
+        "Reply with:  CLASS SUBJECT\n"
+        "Example:  10 Science\n\n"
+        "Or send  ALL  to reset everything.",
+    )
+    context.user_data["awaiting_reset"] = True
+
+
+async def cmd_status(update: Update,
+                     context: ContextTypes.DEFAULT_TYPE):
+    """/status — Show available question counts for teacher's class+subject."""
+    chat_id = str(update.effective_chat.id)
+    if not is_approved_user(chat_id):
+        await update.message.reply_text(_access_denied())
+        return
+
+    await update.message.reply_text(
+        "📊 Status Check\n\n"
+        "Send me:  CLASS SUBJECT\n"
+        "Example:  10 Science\n\n"
+        "I'll show how many questions are available.",
+    )
+    context.user_data["awaiting_status"] = True
+
+
+async def handle_text_commands(update: Update,
+                                context: ContextTypes.DEFAULT_TYPE):
+    """Handle free-text replies for /status and /reset_numbers."""
+    text    = update.message.text.strip()
+    chat_id = str(update.effective_chat.id)
+
+    if context.user_data.get("awaiting_status"):
+        context.user_data.pop("awaiting_status")
+        parts = text.split(None, 1)
+        if len(parts) < 2:
+            await update.message.reply_text(
+                "Format: CLASS SUBJECT\nExample: 10 Science")
+            return
+        cls, subj = parts[0], parts[1]
+        all_qs = fetch_questions_from_firestore(cls, subj)
+        used   = _load_used_questions(chat_id, cls, subj)
+        c1 = len([q for q in all_qs if q.get("marks")==1])
+        c2 = len([q for q in all_qs if q.get("marks")==2])
+        c3 = len([q for q in all_qs if q.get("marks")==3])
+        c5 = len([q for q in all_qs if q.get("marks")==5])
+        u1 = len([q for q in all_qs if q.get("marks")==1
+                  and q.get("question","") in used])
+        u2 = len([q for q in all_qs if q.get("marks")==2
+                  and q.get("question","") in used])
+        u3 = len([q for q in all_qs if q.get("marks")==3
+                  and q.get("question","") in used])
+        u5 = len([q for q in all_qs if q.get("marks")==5
+                  and q.get("question","") in used])
+        next_num = get_next_question_number(chat_id, cls, subj)
+        await update.message.reply_text(
+            f"📊 Class {cls} — {subj}\n\n"
+            f"1-Mark : {c1} total  |  {c1-u1} unused  |  {u1} used\n"
+            f"2-Mark : {c2} total  |  {c2-u2} unused  |  {u2} used\n"
+            f"3-Mark : {c3} total  |  {c3-u3} unused  |  {u3} used\n"
+            f"5-Mark : {c5} total  |  {c5-u5} unused  |  {u5} used\n\n"
+            f"Next question number: {next_num}"
+        )
+        return
+
+    if context.user_data.get("awaiting_reset"):
+        context.user_data.pop("awaiting_reset")
+        chat_id_str = str(update.effective_chat.id)
+        if text.upper() == "ALL":
+            try:
+                db = get_db()
+                if db:
+                    docs = (db.collection("teacher_paper_history")
+                              .where("__name__", ">=", chat_id_str)
+                              .stream())
+                    for d in docs:
+                        d.reference.delete()
+                    docs2 = (db.collection("used_questions")
+                               .where("__name__", ">=", chat_id_str)
+                               .stream())
+                    for d in docs2:
+                        d.reference.delete()
+            except Exception as e:
+                logger.error(f"Reset all error: {e}")
+            await update.message.reply_text(
+                "✅ All question numbering reset to Q.1\n"
+                "All used question history cleared.")
+        else:
+            parts = text.split(None, 1)
+            if len(parts) < 2:
+                await update.message.reply_text(
+                    "Format: CLASS SUBJECT or ALL")
+                return
+            cls, subj = parts[0], parts[1]
+            save_next_question_number(chat_id_str, cls, subj, 1)
+            try:
+                db = get_db()
+                if db:
+                    key = f"{chat_id_str}_{cls}_{subj.replace(' ','_')}"
+                    db.collection("used_questions").document(key).delete()
+            except Exception:
+                pass
+            await update.message.reply_text(
+                f"✅ Reset Class {cls} — {subj}\n"
+                "Numbering starts from Q.1 next time.\n"
+                "All used question history cleared.")
+        return
+
+
 def main():
     if TELEGRAM_BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
         print("ERROR: Set TELEGRAM_BOT_TOKEN!")
@@ -819,7 +1275,17 @@ def main():
     )
 
     app.add_handler(conv)
-    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("help",          help_cmd))
+    app.add_handler(CommandHandler("pending",        cmd_pending))
+    app.add_handler(CommandHandler("approved",       cmd_approved_list))
+    app.add_handler(CommandHandler("remove",         cmd_remove))
+    app.add_handler(CommandHandler("reset_numbers",  cmd_reset_numbers))
+    app.add_handler(CommandHandler("status",         cmd_status))
+    app.add_handler(CallbackQueryHandler(handle_approval_callback,
+                                          pattern="^(approve|reject):"))
+    # Handle free-text replies for /status and /reset_numbers
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND, handle_text_commands))
 
     print("TN Exam Bot is running...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
