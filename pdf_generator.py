@@ -2,92 +2,53 @@
 pdf_generator.py
 Exact TN Board question paper format.
 Supports: Question Paper + Answer Key generation
-Tamil font: place NotoSansTamil-Regular.ttf or Latha.ttf in project folder.
+Uses WeasyPrint for proper Tamil character shaping via Pango/HarfBuzz.
 """
 
 import os
+import html as html_mod
 from datetime import datetime
 
 try:
-    from reportlab.lib.pagesizes import A4
-    from reportlab.lib.styles import ParagraphStyle
-    from reportlab.lib.units import cm
-    from reportlab.lib import colors
-    from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer,
-                                     Table, TableStyle, HRFlowable)
-    from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
-    from reportlab.pdfbase import pdfmetrics
-    from reportlab.pdfbase.ttfonts import TTFont
-    from reportlab.pdfgen import canvas as pdfcanvas
-    REPORTLAB_OK = True
+    from weasyprint import HTML, CSS
+    WEASYPRINT_OK = True
 except ImportError:
-    REPORTLAB_OK = False
+    WEASYPRINT_OK = False
 
 from config import EXAM_FOOTER
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-TAMIL_CANDIDATES = [
-    ("/usr/share/fonts/truetype/freefont/FreeSans.ttf",           "FreeSans"),
-    ("/usr/share/fonts/truetype/lohit-tamil/Lohit-Tamil.ttf",     "Lohit-Tamil"),
-    ("/usr/share/fonts/truetype/noto/NotoSansTamil-Regular.ttf",  "NotoSansTamil"),
-    ("/usr/share/fonts/opentype/noto/NotoSansTamil-Regular.ttf",  "NotoSansTamil"),
-    (os.path.join(BASE_DIR, "NotoSansTamil-Regular.ttf"),         "NotoSansTamil"),
-    (os.path.join(BASE_DIR, "Latha.ttf"),                         "Latha"),
-    (os.path.join(BASE_DIR, "FreeSans.ttf"),                      "FreeSans"),
-    ("C:/Windows/Fonts/Latha.ttf",                                "Latha"),
-    ("C:/Windows/Fonts/latha.ttf",                                "Latha"),
+# ── Tamil font discovery ──────────────────────────────────────────────
+# WeasyPrint uses CSS @font-face; we locate a font file and embed it.
+
+TAMIL_FONT_CANDIDATES = [
+    "/usr/share/fonts/truetype/noto/NotoSansTamil-Regular.ttf",
+    "/usr/share/fonts/opentype/noto/NotoSansTamil-Regular.ttf",
+    "/usr/share/fonts/truetype/lohit-tamil/Lohit-Tamil.ttf",
+    "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+    os.path.join(BASE_DIR, "NotoSansTamil-Regular.ttf"),
+    os.path.join(BASE_DIR, "Latha.ttf"),
+    os.path.join(BASE_DIR, "FreeSans.ttf"),
+    "C:/Windows/Fonts/Latha.ttf",
+    "C:/Windows/Fonts/latha.ttf",
 ]
 
-_FONT_NAME = None
+_TAMIL_FONT_PATH = None
 
-def _get_font():
-    global _FONT_NAME
-    if _FONT_NAME:
-        return _FONT_NAME
-    if not REPORTLAB_OK:
-        _FONT_NAME = "Helvetica"
-        return _FONT_NAME
-    for path, name in TAMIL_CANDIDATES:
+def _get_tamil_font_path() -> str:
+    """Return the first available Tamil font file path, or empty string."""
+    global _TAMIL_FONT_PATH
+    if _TAMIL_FONT_PATH is not None:
+        return _TAMIL_FONT_PATH
+    for path in TAMIL_FONT_CANDIDATES:
         if os.path.exists(path) and os.path.getsize(path) > 5000:
-            try:
-                pdfmetrics.registerFont(TTFont(name, path))
-                _FONT_NAME = name
-                print(f"[PDF] Tamil font: {name}  ({path})")
-                return _FONT_NAME
-            except Exception as e:
-                print(f"[PDF] Font load failed ({path}): {e}")
-    print("[PDF] No Tamil font — using Helvetica")
-    _FONT_NAME = "Helvetica"
-    return _FONT_NAME
-
-
-# ── Watermark canvas ─────────────────────────────────────────────────
-
-class _WMCanvas(pdfcanvas.Canvas):
-    def __init__(self, filename, wm_text="EduPulse-JB", **kw):
-        super().__init__(filename, **kw)
-        self._pages   = []
-        self._wm_text = wm_text
-
-    def showPage(self):
-        self._pages.append(dict(self.__dict__))
-        self._startPage()
-
-    def save(self):
-        for state in self._pages:
-            self.__dict__.update(state)
-            self._draw_wm()
-            super().showPage()
-        super().save()
-
-    def _draw_wm(self):
-        self.saveState()
-        self.setFont("Helvetica", 7)
-        self.setFillColorRGB(0.78, 0.78, 0.78)
-        w, h = A4
-        self.drawRightString(w - 1.5*cm, 0.7*cm, self._wm_text)
-        self.restoreState()
+            _TAMIL_FONT_PATH = path
+            print(f"[PDF] Tamil font: {path}")
+            return _TAMIL_FONT_PATH
+    print("[PDF] No Tamil font found — system fonts will be used")
+    _TAMIL_FONT_PATH = ""
+    return _TAMIL_FONT_PATH
 
 
 # ── Language detection ────────────────────────────────────────────────
@@ -101,6 +62,7 @@ def _detect_language(questions: list) -> str:
         if text.strip():
             return "ta" if _is_tamil(text) else "en"
     return "en"
+
 
 _HEADINGS = {
     "ta": {
@@ -143,186 +105,311 @@ def _score(mark, count):
 
 ROMAN = {1: "I", 2: "II", 3: "III", 4: "IV"}
 
-
-# ── Core builder (shared by question paper + answer key) ─────────────
-
-def _build_pdf(output_path, story, wm_text="EduPulse-JB"):
-    doc = SimpleDocTemplate(
-        output_path, pagesize=A4,
-        leftMargin=2*cm, rightMargin=2*cm,
-        topMargin=1.9*cm, bottomMargin=1.9*cm)
-
-    class _Canvas(_WMCanvas):
-        def __init__(self, filename, **kw):
-            super().__init__(filename, wm_text=wm_text, **kw)
-
-    doc.build(story, canvasmaker=_Canvas)
+def _e(text) -> str:
+    """HTML-escape a string."""
+    return html_mod.escape(str(text))
 
 
-def _make_story(fn, H, class_, subject, lesson, groups, part_d_qs,
+# ── CSS stylesheet ────────────────────────────────────────────────────
+
+def _build_css(font_path: str) -> str:
+    font_face = ""
+    if font_path:
+        font_face = f"""
+@font-face {{
+    font-family: 'TamilFont';
+    src: url('{font_path}');
+}}"""
+
+    return f"""
+{font_face}
+
+@page {{
+    size: A4;
+    margin: 1.9cm 2cm;
+    @bottom-right {{
+        content: "EduPulse-JB";
+        font-size: 7pt;
+        color: #c8c8c8;
+    }}
+}}
+
+* {{
+    box-sizing: border-box;
+}}
+
+body {{
+    font-family: 'TamilFont', 'Noto Sans Tamil', 'Lohit Tamil', FreeSans, Arial, sans-serif;
+    font-size: 10pt;
+    line-height: 1.35;
+    color: #000;
+    margin: 0;
+    padding: 0;
+}}
+
+.header-top {{
+    text-align: center;
+    font-size: 16pt;
+    font-weight: bold;
+    margin: 0 0 4pt 0;
+}}
+
+.header-sub {{
+    text-align: center;
+    font-size: 12pt;
+    margin: 0 0 6pt 0;
+}}
+
+.header-class {{
+    text-align: center;
+    font-size: 11pt;
+    margin: 0 0 4pt 0;
+}}
+
+.answer-key-label {{
+    text-align: center;
+    font-size: 12pt;
+    font-weight: bold;
+    color: #c0392b;
+    margin: 0 0 6pt 0;
+}}
+
+.header-row {{
+    display: table;
+    width: 100%;
+    margin-bottom: 4pt;
+}}
+
+.header-row-left,
+.header-row-center,
+.header-row-right {{
+    display: table-cell;
+    font-size: 9pt;
+    vertical-align: middle;
+}}
+
+.header-row-left   {{ text-align: left; width: 33%; }}
+.header-row-center {{ text-align: center; width: 34%; }}
+.header-row-right  {{ text-align: right; width: 33%; }}
+
+hr.thick {{
+    border: none;
+    border-top: 1pt solid #000;
+    margin: 2pt 0 6pt 0;
+}}
+
+hr.thin {{
+    border: none;
+    border-top: 0.5pt solid #ccc;
+    margin: 12pt 0 4pt 0;
+}}
+
+.section-row {{
+    display: table;
+    width: 100%;
+    margin-top: 10pt;
+    margin-bottom: 2pt;
+}}
+
+.section-title {{
+    display: table-cell;
+    font-size: 10pt;
+    font-weight: bold;
+    width: 80%;
+}}
+
+.section-marks {{
+    display: table-cell;
+    font-size: 10pt;
+    font-weight: bold;
+    text-align: right;
+    width: 20%;
+}}
+
+.section-sub {{
+    font-size: 9pt;
+    color: #333;
+    margin: 0 0 4pt 12pt;
+}}
+
+.question {{
+    margin: 2pt 0 4pt 12pt;
+    font-size: 10pt;
+}}
+
+.options {{
+    margin: 0 0 5pt 24pt;
+    font-size: 10pt;
+}}
+
+.or-line {{
+    text-align: center;
+    font-size: 10pt;
+    margin: 3pt 0;
+}}
+
+.answer {{
+    margin: 0 0 6pt 24pt;
+    font-size: 9pt;
+    color: #1a5276;
+}}
+
+.footer-text {{
+    text-align: center;
+    font-size: 9pt;
+    color: #555;
+    margin-top: 4pt;
+}}
+
+.wm-answer-key @page {{
+    @bottom-right {{
+        content: "Answer Key — EduPulse-JB";
+    }}
+}}
+"""
+
+
+# ── HTML builder ──────────────────────────────────────────────────────
+
+def _build_html(H, class_, subject, lesson, groups, part_d_qs,
                 pairs, total, school_name, test_name,
                 is_answer_key=False, start_number=1):
-    """Build the ReportLab story list for one paper or answer key."""
+    """Build the full HTML document for one paper or answer key."""
 
-    def S(name, size, align=TA_LEFT, color=None, sb=0, sa=4, li=0):
-        return ParagraphStyle(
-            name, fontName=fn, fontSize=size,
-            leading=round(size * 1.32, 1),
-            alignment=align,
-            textColor=colors.HexColor(color) if color else colors.black,
-            spaceBefore=sb, spaceAfter=sa,
-            leftIndent=li)
-
-    story = []
+    parts = []
+    parts.append('<!DOCTYPE html><html lang="ta"><head>')
+    parts.append('<meta charset="UTF-8">')
+    parts.append('</head><body>')
 
     # ── Header ───────────────────────────────────────────────────────
     if school_name or test_name:
         top = school_name if school_name else test_name
-        story.append(Paragraph(top, S("top", 16, align=TA_CENTER, sb=0, sa=2)))
+        parts.append(f'<div class="header-top">{_e(top)}</div>')
     if school_name and test_name:
-        story.append(Paragraph(test_name, S("tn", 12, align=TA_CENTER, sb=0, sa=4)))
+        parts.append(f'<div class="header-sub">{_e(test_name)}</div>')
 
-    story.append(Paragraph(
-        f"{class_} – ஆம் வகுப்பு          {subject}",
-        S("cs", 11, align=TA_CENTER, sb=0, sa=2)))
+    parts.append(
+        f'<div class="header-class">'
+        f'{_e(class_)} – ஆம் வகுப்பு &nbsp;&nbsp;&nbsp;&nbsp;&nbsp; {_e(subject)}'
+        f'</div>')
 
     if is_answer_key:
-        story.append(Paragraph(
-            f"[ {H['answer_key']} ]",
-            S("ak", 12, align=TA_CENTER, sb=0, sa=4,
-               color="#c0392b")))
+        parts.append(
+            f'<div class="answer-key-label">[ {_e(H["answer_key"])} ]</div>')
 
-    hdr_data = [[
-        Paragraph(H["duration"],            S("hl", 9, align=TA_LEFT)),
-        Paragraph(lesson,                   S("hc", 9, align=TA_CENTER)),
-        Paragraph(H["total"].format(t=total),S("hr", 9, align=TA_RIGHT)),
-    ]]
-    ht = Table(hdr_data, colWidths=["33%","34%","33%"])
-    ht.setStyle(TableStyle([
-        ("FONTNAME",      (0,0),(-1,-1), fn),
-        ("FONTSIZE",      (0,0),(-1,-1), 9),
-        ("TOPPADDING",    (0,0),(-1,-1), 1),
-        ("BOTTOMPADDING", (0,0),(-1,-1), 3),
-    ]))
-    story.append(ht)
-    story.append(HRFlowable(width="100%", thickness=1, color=colors.black))
-    story.append(Spacer(1, 6))
+    parts.append('<div class="header-row">')
+    parts.append(f'<div class="header-row-left">{_e(H["duration"])}</div>')
+    parts.append(f'<div class="header-row-center">{_e(lesson)}</div>')
+    parts.append(f'<div class="header-row-right">{_e(H["total"].format(t=total))}</div>')
+    parts.append('</div>')
+    parts.append('<hr class="thick">')
 
-    # ── Styles ───────────────────────────────────────────────────────
-    sec_num  = 0
     global_n = start_number
 
-    q_style  = S("q",  10, sb=1, sa=4, li=12)
-    opt_s    = S("opt",10, sb=0, sa=5, li=24)
-    or_s     = S("or", 10, align=TA_CENTER, sb=2, sa=2)
-    sub_s    = S("sub", 9, sb=0, sa=2, li=12, color="#333333")
-    ans_s    = S("ans", 9, sb=0, sa=6, li=24, color="#1a5276")
-
-    def _sec_heading(main, sub, marks_str):
-        data = [[
-            Paragraph(f"{ROMAN[sec_num]}   {main}",
-                      S(f"sh{sec_num}", 10, sb=8, sa=1)),
-            Paragraph(marks_str,
-                      S(f"sr{sec_num}", 10, align=TA_RIGHT, sb=8, sa=1)),
-        ]]
-        t = Table(data, colWidths=["80%","20%"])
-        t.setStyle(TableStyle([
-            ("FONTNAME",      (0,0),(-1,-1), fn),
-            ("FONTSIZE",      (0,0),(-1,-1), 10),
-            ("TOPPADDING",    (0,0),(-1,-1), 2),
-            ("BOTTOMPADDING", (0,0),(-1,-1), 2),
-        ]))
-        story.append(t)
+    def _sec_heading(roman, main, sub, marks_str):
+        parts.append('<div class="section-row">')
+        parts.append(f'<div class="section-title">{roman}&nbsp;&nbsp;&nbsp;{_e(main)}</div>')
+        parts.append(f'<div class="section-marks">{_e(marks_str)}</div>')
+        parts.append('</div>')
         if sub:
-            story.append(Paragraph(sub, sub_s))
+            parts.append(f'<div class="section-sub">{_e(sub)}</div>')
 
     # ── Section I ────────────────────────────────────────────────────
     if 1 in groups and groups[1]:
-        qs = groups[1]; n1 = len(qs); sec_num = 1
-        _sec_heading(H["sec1_main"], H["sec1_sub"], f"{n1}X1={n1}")
+        qs = groups[1]
+        n1 = len(qs)
+        _sec_heading(ROMAN[1], H["sec1_main"], H["sec1_sub"], f"{n1}X1={n1}")
         for q in qs:
-            story.append(Paragraph(
-                f"{global_n}.&nbsp; {q.get('question','')}", q_style))
-            opts = q.get("options","")
+            parts.append(
+                f'<div class="question">{global_n}.&nbsp; {_e(q.get("question",""))}</div>')
+            opts = q.get("options", "")
             if opts:
                 opt_list = [o.strip() for o in opts.split("|")]
-                labels   = ["(அ)","(ஆ)","(இ)","(ஈ)"]
-                line = "  ".join(
-                    f"{labels[i]} {opt_list[i]}"
-                    for i in range(min(len(labels),len(opt_list))))
-                story.append(Paragraph(line, opt_s))
+                labels   = ["(அ)", "(ஆ)", "(இ)", "(ஈ)"]
+                line = "&nbsp;&nbsp;".join(
+                    f"{labels[i]} {_e(opt_list[i])}"
+                    for i in range(min(len(labels), len(opt_list))))
+                parts.append(f'<div class="options">{line}</div>')
             if is_answer_key:
-                ans = q.get("answer","") or q.get("correct_option","")
+                ans = q.get("answer", "") or q.get("correct_option", "")
                 if ans:
-                    story.append(Paragraph(
-                        f"{H['answer_lbl']}: {ans}", ans_s))
+                    parts.append(
+                        f'<div class="answer">{_e(H["answer_lbl"])}: {_e(ans)}</div>')
             global_n += 1
-        story.append(Spacer(1,4))
 
     # ── Section II ───────────────────────────────────────────────────
     if 2 in groups and groups[2]:
-        qs = groups[2]; n2 = len(qs); ans2 = min(n2,7); sec_num = 2
-        _sec_heading(H["sec2_main"],
-                     H["sec2_sub"].format(q=global_n+ans2-1),
+        qs   = groups[2]
+        n2   = len(qs)
+        ans2 = min(n2, 7)
+        _sec_heading(ROMAN[2], H["sec2_main"],
+                     H["sec2_sub"].format(q=global_n + ans2 - 1),
                      f"{ans2}X2={ans2*2}")
         for q in qs:
-            story.append(Paragraph(
-                f"{global_n}.&nbsp; {q.get('question','')}", q_style))
+            parts.append(
+                f'<div class="question">{global_n}.&nbsp; {_e(q.get("question",""))}</div>')
             if is_answer_key:
-                ans = q.get("answer","")
+                ans = q.get("answer", "")
                 if ans:
-                    story.append(Paragraph(
-                        f"{H['answer_lbl']}: {ans}", ans_s))
+                    parts.append(
+                        f'<div class="answer">{_e(H["answer_lbl"])}: {_e(ans)}</div>')
             global_n += 1
-        story.append(Spacer(1,4))
 
     # ── Section III ──────────────────────────────────────────────────
     if 3 in groups and groups[3]:
-        qs = groups[3]; n3 = len(qs); ans3 = min(n3,7); sec_num = 3
-        _sec_heading(H["sec3_main"],
-                     H["sec3_sub"].format(q=global_n+ans3-1),
+        qs   = groups[3]
+        n3   = len(qs)
+        ans3 = min(n3, 7)
+        _sec_heading(ROMAN[3], H["sec3_main"],
+                     H["sec3_sub"].format(q=global_n + ans3 - 1),
                      f"{ans3}X3={ans3*3}")
         for q in qs:
-            story.append(Paragraph(
-                f"{global_n}.&nbsp; {q.get('question','')}", q_style))
+            parts.append(
+                f'<div class="question">{global_n}.&nbsp; {_e(q.get("question",""))}</div>')
             if is_answer_key:
-                ans = q.get("answer","")
+                ans = q.get("answer", "")
                 if ans:
-                    story.append(Paragraph(
-                        f"{H['answer_lbl']}: {ans}", ans_s))
+                    parts.append(
+                        f'<div class="answer">{_e(H["answer_lbl"])}: {_e(ans)}</div>')
             global_n += 1
-        story.append(Spacer(1,4))
 
     # ── Section IV ───────────────────────────────────────────────────
     if part_d_qs and pairs > 0:
-        sec_num = 4
-        _sec_heading(H["sec4_main"], H["sec4_sub"], f"{pairs}X5={pairs*5}")
-        for i in range(0, len(part_d_qs)-1, 2):
-            qa  = part_d_qs[i].get("question","")
-            qb  = part_d_qs[i+1].get("question","")
-            ans = part_d_qs[i].get("answer","")
-            story.append(Paragraph(
-                f"{global_n}.&nbsp; {qa}", q_style))
-            story.append(Paragraph(H["or"], or_s))
-            story.append(Paragraph(
-                f"&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;{qb}",
-                q_style))
+        _sec_heading(ROMAN[4], H["sec4_main"], H["sec4_sub"],
+                     f"{pairs}X5={pairs*5}")
+        for i in range(0, len(part_d_qs) - 1, 2):
+            qa  = part_d_qs[i].get("question", "")
+            qb  = part_d_qs[i + 1].get("question", "")
+            ans = part_d_qs[i].get("answer", "")
+            parts.append(
+                f'<div class="question">{global_n}.&nbsp; {_e(qa)}</div>')
+            parts.append(f'<div class="or-line">{_e(H["or"])}</div>')
+            parts.append(
+                f'<div class="question">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;{_e(qb)}</div>')
             if is_answer_key and ans:
-                story.append(Paragraph(
-                    f"{H['answer_lbl']}: {ans}", ans_s))
-            story.append(Spacer(1,6))
+                parts.append(
+                    f'<div class="answer">{_e(H["answer_lbl"])}: {_e(ans)}</div>')
             global_n += 1
 
     # ── Footer ───────────────────────────────────────────────────────
-    story.append(Spacer(1,16))
-    story.append(HRFlowable(
-        width="100%", thickness=0.5,
-        color=colors.HexColor("#cccccc")))
-    story.append(Paragraph(
-        EXAM_FOOTER,
-        S("ft", 9, align=TA_CENTER, color="#555555", sb=4)))
+    parts.append('<hr class="thin">')
+    parts.append(f'<div class="footer-text">{_e(EXAM_FOOTER)}</div>')
 
-    return story, global_n  # return next question number
+    parts.append('</body></html>')
+    return "".join(parts), global_n
+
+
+# ── Core PDF writer ───────────────────────────────────────────────────
+
+def _write_pdf(html_content: str, css_content: str, output_path: str,
+               wm_text: str = "EduPulse-JB"):
+    """Render HTML+CSS to a PDF file using WeasyPrint."""
+    # Patch watermark text into the CSS @page rule
+    css_with_wm = css_content.replace(
+        '"EduPulse-JB"', f'"{wm_text}"', 1)
+    HTML(string=html_content).write_pdf(
+        output_path,
+        stylesheets=[CSS(string=css_with_wm)])
 
 
 # ── Public: Question Paper PDF ────────────────────────────────────────
@@ -344,11 +431,10 @@ def generate_question_paper_pdf(
         output_path = os.path.join(
             "generated_papers", f"Class{class_}_{safe}_{ts}.pdf")
 
-    if not REPORTLAB_OK:
-        print("[PDF] reportlab not installed.")
+    if not WEASYPRINT_OK:
+        print("[PDF] weasyprint not installed.")
         return ""
 
-    fn        = _get_font()
     all_qs    = questions + (part_d or [])
     lang      = _detect_language(all_qs)
     H         = _HEADINGS[lang]
@@ -356,21 +442,23 @@ def generate_question_paper_pdf(
     other_qs  = [q for q in questions if q.get("marks") != 5]
     groups    = {}
     for q in other_qs:
-        groups.setdefault(q.get("marks",1),[]).append(q)
+        groups.setdefault(q.get("marks", 1), []).append(q)
     pairs = len(part_d_qs) // 2
-    total = (_score(1,len(groups.get(1,[]))) +
-             _score(2,len(groups.get(2,[]))) +
-             _score(3,len(groups.get(3,[]))) +
+    total = (_score(1, len(groups.get(1, []))) +
+             _score(2, len(groups.get(2, []))) +
+             _score(3, len(groups.get(3, []))) +
              pairs * 5)
 
     try:
-        story, _ = _make_story(
-            fn, H, class_, subject, lesson,
+        font_path  = _get_tamil_font_path()
+        css        = _build_css(font_path)
+        html, _    = _build_html(
+            H, class_, subject, lesson,
             groups, part_d_qs, pairs, total,
             school_name, test_name,
             is_answer_key=False,
             start_number=start_number)
-        _build_pdf(output_path, story)
+        _write_pdf(html, css, output_path, wm_text="EduPulse-JB")
         print(f"[PDF] Question paper: {output_path}")
         return output_path
     except Exception as e:
@@ -399,11 +487,10 @@ def generate_answer_key_pdf(
             "generated_papers",
             f"Class{class_}_{safe}_{ts}_ANSWER_KEY.pdf")
 
-    if not REPORTLAB_OK:
-        print("[PDF] reportlab not installed.")
+    if not WEASYPRINT_OK:
+        print("[PDF] weasyprint not installed.")
         return ""
 
-    fn        = _get_font()
     all_qs    = questions + (part_d or [])
     lang      = _detect_language(all_qs)
     H         = _HEADINGS[lang]
@@ -411,21 +498,24 @@ def generate_answer_key_pdf(
     other_qs  = [q for q in questions if q.get("marks") != 5]
     groups    = {}
     for q in other_qs:
-        groups.setdefault(q.get("marks",1),[]).append(q)
+        groups.setdefault(q.get("marks", 1), []).append(q)
     pairs = len(part_d_qs) // 2
-    total = (_score(1,len(groups.get(1,[]))) +
-             _score(2,len(groups.get(2,[]))) +
-             _score(3,len(groups.get(3,[]))) +
+    total = (_score(1, len(groups.get(1, []))) +
+             _score(2, len(groups.get(2, []))) +
+             _score(3, len(groups.get(3, []))) +
              pairs * 5)
 
     try:
-        story, _ = _make_story(
-            fn, H, class_, subject, lesson,
+        font_path  = _get_tamil_font_path()
+        css        = _build_css(font_path)
+        html, _    = _build_html(
+            H, class_, subject, lesson,
             groups, part_d_qs, pairs, total,
             school_name, test_name,
             is_answer_key=True,
             start_number=start_number)
-        _build_pdf(output_path, story, wm_text="Answer Key — EduPulse-JB")
+        _write_pdf(html, css, output_path,
+                   wm_text="Answer Key — EduPulse-JB")
         print(f"[PDF] Answer key: {output_path}")
         return output_path
     except Exception as e:
