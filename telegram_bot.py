@@ -20,7 +20,6 @@ from telegram.ext import (
 )
 
 from config import TELEGRAM_BOT_TOKEN, ADMIN_CHAT_ID
-from usage_logger import log_paper_generation
 from firebase_sync import (
     is_approved_user,
     fetch_questions_from_firestore,
@@ -1001,18 +1000,18 @@ async def confirm_generate(update: Update,
     )
 
     # ── Log usage to Excel + Drive ──
-    log_paper_generation(
-        teacher_name = teacher,
-        chat_id      = str(update.effective_chat.id),
-        class_       = class_,
-        subject      = subject,
-        lessons      = display,
-        q1           = len(part_a),
-        q2           = len(part_b),
-        q3           = len(part_c),
-        q5_pairs     = actual_q5_pairs,
-        total_marks  = total_marks,
-    )
+    # log_paper_generation(
+    #     teacher_name = teacher,
+    #     chat_id      = str(update.effective_chat.id),
+    #     class_       = class_,
+    #     subject      = subject,
+    #     lessons      = display,
+    #     q1           = len(part_a),
+    #     q2           = len(part_b),
+    #     q3           = len(part_c),
+    #     q5_pairs     = actual_q5_pairs,
+    #     total_marks  = total_marks,
+    # )
 
     actual_pairs_display = actual_q5_pairs if actual_q5_pairs > 0 else 0
     total_q_display = len(part_a) + len(part_b) + len(part_c) + actual_pairs_display
