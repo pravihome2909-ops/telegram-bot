@@ -1,11 +1,8 @@
 """
 docx_generator.py
-Layout : A4, L=2cm R=2cm T=1.9cm B=1.9cm, line-spacing 1.15
-Header : Test Name | Class & Lessons | Marks breakdown
-Footer : All The Best  +  EduPulse-JB watermark (bottom-right)
-Tamil  : Uses FreeSans / Noto / Latha — whichever exists on the system.
-         On Railway Linux: apt-get install -y fonts-freefont-ttf
-         On Windows PC  : Latha is built-in (C:/Windows/Fonts/Latha.ttf)
+Exact TN Board format in Word.
+Supports: Question Paper + Answer Key
+Tamil font auto-detected.
 """
 
 import os
@@ -14,7 +11,7 @@ from datetime import datetime
 
 try:
     from docx import Document
-    from docx.shared import Pt, Cm, RGBColor, Inches
+    from docx.shared import Pt, Cm, RGBColor
     from docx.enum.text import WD_ALIGN_PARAGRAPH
     from docx.oxml.ns import qn
     from docx.oxml import OxmlElement
@@ -26,68 +23,105 @@ from config import EXAM_FOOTER
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# ── Tamil font detection ──────────────────────────────────────────────
-# Priority order — first found wins
 _FONT_CANDIDATES = [
-    # Linux (Railway) — installed via apt-get install -y fonts-freefont-ttf
-    ("/usr/share/fonts/truetype/freefont/FreeSans.ttf",    "FreeSans"),
-    ("/usr/share/fonts/truetype/lohit-tamil/Lohit-Tamil.ttf", "Lohit Tamil"),
-    ("/usr/share/fonts/truetype/noto/NotoSansTamil-Regular.ttf", "Noto Sans Tamil"),
-    # Project folder (place any Tamil .ttf here)
-    (os.path.join(BASE_DIR, "NotoSansTamil-Regular.ttf"), "Noto Sans Tamil"),
-    (os.path.join(BASE_DIR, "Latha.ttf"),                 "Latha"),
-    (os.path.join(BASE_DIR, "FreeSans.ttf"),              "FreeSans"),
-    # Windows built-in
-    ("C:/Windows/Fonts/latha.ttf",   "Latha"),
-    ("C:/Windows/Fonts/Latha.ttf",   "Latha"),
-    ("C:/Windows/Fonts/freesans.ttf","FreeSans"),
+    ("/usr/share/fonts/truetype/freefont/FreeSans.ttf",           "FreeSans"),
+    ("/usr/share/fonts/truetype/lohit-tamil/Lohit-Tamil.ttf",     "Lohit Tamil"),
+    ("/usr/share/fonts/truetype/noto/NotoSansTamil-Regular.ttf",  "Noto Sans Tamil"),
+    ("/usr/share/fonts/opentype/noto/NotoSansTamil-Regular.ttf",  "Noto Sans Tamil"),
+    (os.path.join(BASE_DIR, "NotoSansTamil-Regular.ttf"),         "Noto Sans Tamil"),
+    (os.path.join(BASE_DIR, "Latha.ttf"),                         "Latha"),
+    (os.path.join(BASE_DIR, "FreeSans.ttf"),                      "FreeSans"),
+    ("C:/Windows/Fonts/Latha.ttf",                                "Latha"),
+    ("C:/Windows/Fonts/latha.ttf",                                "Latha"),
 ]
 
-def _detect_tamil_font() -> str:
+def _detect_font():
     for path, name in _FONT_CANDIDATES:
-        if os.path.exists(path) and os.path.getsize(path) > 1000:
-            print(f"[DOCX] Tamil font: {name}  ({path})")
+        if os.path.exists(path) and os.path.getsize(path) > 5000:
+            print(f"[DOCX] Tamil font: {name}")
             return name
-    print("[DOCX] No Tamil font found — using Arial (Tamil may show boxes).")
-    print("       Run: apt-get install -y fonts-freefont-ttf")
+    print("[DOCX] No Tamil font — using Arial")
     return "Arial"
 
-TAMIL_FONT = _detect_tamil_font()
+TAMIL_FONT = _detect_font()
+ROMAN = {1: "I", 2: "II", 3: "III", 4: "IV"}
+
+
+# ── Language detection ────────────────────────────────────────────────
+
+def _is_tamil(text: str) -> bool:
+    return any('\u0B80' <= ch <= '\u0BFF' for ch in text)
+
+def _detect_language(questions: list) -> str:
+    for q in questions:
+        t = q.get("question", "")
+        if t.strip():
+            return "ta" if _is_tamil(t) else "en"
+    return "en"
+
+_HEADINGS = {
+    "ta": {
+        "sec1_main": "அனைத்து வினாக்களுக்கும் விடையளிக்கவும்.",
+        "sec1_sub":  "",
+        "sec2_main": "எவையேனும் 7 வினாக்களுக்கு விடையளிக்கவும்.",
+        "sec2_sub":  "வினா எண். {q} க்கு கட்டாயம் விடையளிக்கவும்.",
+        "sec3_main": "எவையேனும் 7 வினாக்களுக்கு விடையளிக்கவும்.",
+        "sec3_sub":  "வினா எண். {q} க்கு கட்டாயம் விடையளிக்கவும்.",
+        "sec4_main": "அனைத்து வினாக்களுக்கும் விடையளிக்கவும்.",
+        "sec4_sub":  "",
+        "or":        "(அல்லது)",
+        "duration":  "நேரம் : 3.00 மணி",
+        "total":     "மதிப்பெண்கள் : {t}",
+        "answer_key":"விடை குறிப்பு",
+        "answer_lbl":"விடை",
+    },
+    "en": {
+        "sec1_main": "Answer all questions.",
+        "sec1_sub":  "",
+        "sec2_main": "Answer any 7 questions.",
+        "sec2_sub":  "Question No. {q} is compulsory.",
+        "sec3_main": "Answer any 7 questions.",
+        "sec3_sub":  "Question No. {q} is compulsory.",
+        "sec4_main": "Answer all questions.",
+        "sec4_sub":  "",
+        "or":        "(OR)",
+        "duration":  "Time : 3.00 Hours",
+        "total":     "Total Marks : {t}",
+        "answer_key":"ANSWER KEY",
+        "answer_lbl":"Ans",
+    },
+}
+
+def _score(mark, count):
+    if mark == 1: return count
+    if mark == 2: return min(count,7)*2
+    if mark == 3: return min(count,7)*3
+    return count * mark
 
 
 # ── XML helpers ───────────────────────────────────────────────────────
 
-def _font(run, name: str, size_pt: float,
-           bold=False, color_hex: str = None):
-    """Apply font to a run — forces complex-script (Tamil/Indic) font."""
-    run.font.name  = name
-    run.font.size  = Pt(size_pt)
-    run.font.bold  = bold
-    if color_hex:
+def _f(run, name, size, bold=False, color=None):
+    run.font.name = name
+    run.font.size = Pt(size)
+    run.font.bold = bold
+    if color:
         run.font.color.rgb = RGBColor(
-            int(color_hex[0:2], 16),
-            int(color_hex[2:4], 16),
-            int(color_hex[4:6], 16))
-    # Force all script types to use this font
+            int(color[0:2],16), int(color[2:4],16), int(color[4:6],16))
     rPr = run._r.get_or_add_rPr()
     rf  = rPr.find(qn("w:rFonts"))
     if rf is None:
-        rf = OxmlElement("w:rFonts")
-        rPr.insert(0, rf)
-    rf.set(qn("w:ascii"),    name)
-    rf.set(qn("w:hAnsi"),    name)
-    rf.set(qn("w:cs"),       name)   # ← critical for Tamil
-    rf.set(qn("w:eastAsia"), name)
+        rf = OxmlElement("w:rFonts"); rPr.insert(0, rf)
+    for attr in ["w:ascii","w:hAnsi","w:cs","w:eastAsia"]:
+        rf.set(qn(attr), name)
 
-
-def _spacing(para, before=0, after=4, ls=1.15):
+def _sp(para, before=0, after=3, ls=1.15):
     fmt = para.paragraph_format
     fmt.space_before = Pt(before)
     fmt.space_after  = Pt(after)
     fmt.line_spacing = Pt(11 * ls)
 
-
-def _hline(para, color="AAAAAA", thick=4):
+def _hline(para, color="000000", thick=4):
     pPr  = para._p.get_or_add_pPr()
     pBdr = OxmlElement("w:pBdr")
     bot  = OxmlElement("w:bottom")
@@ -95,56 +129,205 @@ def _hline(para, color="AAAAAA", thick=4):
     bot.set(qn("w:sz"),    str(thick * 8))
     bot.set(qn("w:space"), "1")
     bot.set(qn("w:color"), color)
-    pBdr.append(bot)
-    pPr.append(pBdr)
+    pBdr.append(bot); pPr.append(pBdr)
 
-
-def _no_border_cell(cell):
-    tc   = cell._tc
-    tcPr = tc.get_or_add_tcPr()
-    bdr  = OxmlElement("w:tcBdr")
+def _no_border(cell):
+    tc = cell._tc; tcPr = tc.get_or_add_tcPr()
+    bdr = OxmlElement("w:tcBdr")
     for s in ["top","left","bottom","right","insideH","insideV"]:
         e = OxmlElement(f"w:{s}")
-        e.set(qn("w:val"),   "none")
-        e.set(qn("w:sz"),    "0")
-        e.set(qn("w:space"), "0")
-        e.set(qn("w:color"), "auto")
+        e.set(qn("w:val"),"none"); e.set(qn("w:sz"),"0")
+        e.set(qn("w:space"),"0"); e.set(qn("w:color"),"auto")
         bdr.append(e)
     tcPr.append(bdr)
 
+def _no_tbl_border(tbl):
+    tPr = tbl._tbl.find(qn("w:tblPr"))
+    if tPr is None:
+        tPr = OxmlElement("w:tblPr"); tbl._tbl.insert(0, tPr)
+    tb = OxmlElement("w:tblBorders")
+    for s in ["top","left","bottom","right","insideH","insideV"]:
+        e = OxmlElement(f"w:{s}")
+        e.set(qn("w:val"),"none"); e.set(qn("w:sz"),"0")
+        e.set(qn("w:color"),"auto"); tb.append(e)
+    tPr.append(tb)
 
-def _build_footer(section, fn):
-    """Footer: All The Best (left)  ···  EduPulse-JB (right)"""
-    footer = section.footer
-    fp     = footer.paragraphs[0] if footer.paragraphs \
-             else footer.add_paragraph()
-    fp.clear()
-    fp.alignment = WD_ALIGN_PARAGRAPH.LEFT
-    _spacing(fp, before=0, after=0)
-
-    # Left text
-    r1 = fp.add_run(EXAM_FOOTER)
-    _font(r1, fn, 9, color_hex="333333")
-
-    # Tab to right
+def _footer(section, fn, wm_text="EduPulse-JB"):
+    fp = (section.footer.paragraphs[0]
+          if section.footer.paragraphs
+          else section.footer.add_paragraph())
+    fp.clear(); _sp(fp, 0, 0)
+    r1 = fp.add_run(EXAM_FOOTER); _f(r1, fn, 9, color="333333")
     fp.add_run("\t")
-
-    # Right watermark
-    r2 = fp.add_run("EduPulse-JB")
-    _font(r2, "Arial", 8, color_hex="BBBBBB")
-
-    # Tab stop at far right
+    r2 = fp.add_run(wm_text); _f(r2, "Arial", 7, color="BBBBBB")
     pPr  = fp._p.get_or_add_pPr()
     tabs = OxmlElement("w:tabs")
     tab  = OxmlElement("w:tab")
-    tab.set(qn("w:val"),    "right")
-    tab.set(qn("w:pos"),    "9072")  # 16cm in twips
-    tab.set(qn("w:leader"), "none")
-    tabs.append(tab)
-    pPr.append(tabs)
+    tab.set(qn("w:val"),"right"); tab.set(qn("w:pos"),"9072")
+    tab.set(qn("w:leader"),"none")
+    tabs.append(tab); pPr.append(tabs)
+
+def _sec_row(doc, fn, roman, main, sub, marks_str):
+    tbl = doc.add_table(rows=1, cols=2)
+    tbl.style = "Table Grid"
+    cells = tbl.rows[0].cells
+    _no_border(cells[0]); _no_border(cells[1])
+    p0 = cells[0].paragraphs[0]; p0.clear(); _sp(p0, before=8, after=1)
+    r = p0.add_run(f"{roman}   {main}"); _f(r, fn, 10, bold=True)
+    p1 = cells[1].paragraphs[0]; p1.clear()
+    p1.alignment = WD_ALIGN_PARAGRAPH.RIGHT; _sp(p1, before=8, after=1)
+    r2 = p1.add_run(marks_str); _f(r2, fn, 10, bold=True)
+    _no_tbl_border(tbl)
+    if sub:
+        p2 = doc.add_paragraph(); _sp(p2, before=0, after=2)
+        p2.paragraph_format.left_indent = Cm(0.5)
+        r3 = p2.add_run(sub); _f(r3, fn, 9, color="333333")
 
 
-# ── Main generator ────────────────────────────────────────────────────
+# ── Core document builder ─────────────────────────────────────────────
+
+def _build_doc(class_, subject, lesson, groups, part_d_qs,
+               pairs, total, school_name, test_name,
+               fn, H, is_answer_key=False,
+               start_number=1, wm_text="EduPulse-JB") -> Document:
+    doc = Document()
+    LS  = 1.15
+
+    for sec in doc.sections:
+        sec.page_width    = Cm(21.0)
+        sec.page_height   = Cm(29.7)
+        sec.left_margin   = Cm(2.0)
+        sec.right_margin  = Cm(2.0)
+        sec.top_margin    = Cm(1.9)
+        sec.bottom_margin = Cm(1.9)
+        _footer(sec, fn, wm_text)
+
+    # ── Header ───────────────────────────────────────────────────────
+    if school_name or test_name:
+        top = school_name if school_name else test_name
+        p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        _sp(p, 0, 2, LS); r = p.add_run(top); _f(r, fn, 16, bold=True)
+    if school_name and test_name:
+        p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        _sp(p, 0, 3, LS); r = p.add_run(test_name); _f(r, fn, 12)
+
+    if is_answer_key:
+        p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        _sp(p, 0, 3, LS)
+        r = p.add_run(f"[ {H['answer_key']} ]")
+        _f(r, fn, 12, bold=True, color="C0392B")
+
+    p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    _sp(p, 0, 2, LS)
+    r = p.add_run(f"{class_} – ஆம் வகுப்பு          {subject}")
+    _f(r, fn, 11)
+
+    ht = doc.add_table(rows=1, cols=3)
+    ht.style = "Table Grid"
+    hcells = ht.rows[0].cells
+    hdata  = [
+        (H["duration"],               WD_ALIGN_PARAGRAPH.LEFT),
+        (lesson,                       WD_ALIGN_PARAGRAPH.CENTER),
+        (H["total"].format(t=total),   WD_ALIGN_PARAGRAPH.RIGHT),
+    ]
+    for cell, (txt, aln) in zip(hcells, hdata):
+        _no_border(cell)
+        cp = cell.paragraphs[0]; cp.clear()
+        cp.alignment = aln; _sp(cp, 1, 3, LS)
+        r = cp.add_run(txt); _f(r, fn, 9)
+    _no_tbl_border(ht)
+
+    hr = doc.add_paragraph(); _sp(hr, 2, 4, LS)
+    _hline(hr, color="000000", thick=1)
+
+    # ── Sections ─────────────────────────────────────────────────────
+    global_n = start_number
+
+    def _q(text, indent=0.5):
+        p = doc.add_paragraph()
+        p.paragraph_format.left_indent = Cm(indent)
+        _sp(p, 1, 3, LS)
+        r = p.add_run(text); _f(r, fn, 10)
+
+    def _ans(text):
+        p = doc.add_paragraph()
+        p.paragraph_format.left_indent = Cm(1.5)
+        _sp(p, 0, 4, LS)
+        r = p.add_run(f"{H['answer_lbl']}: {text}")
+        _f(r, fn, 9, color="1A5276")
+
+    # Section I
+    if 1 in groups and groups[1]:
+        qs = groups[1]; n1 = len(qs)
+        _sec_row(doc, fn, ROMAN[1], H["sec1_main"], H["sec1_sub"],
+                 f"{n1}X1={n1}")
+        for q in qs:
+            _q(f"{global_n}.  {q.get('question','')}")
+            opts = q.get("options","")
+            if opts:
+                opt_list = [o.strip() for o in opts.split("|")]
+                labels   = ["(அ)","(ஆ)","(இ)","(ஈ)"]
+                line = "   ".join(
+                    f"{labels[i]} {opt_list[i]}"
+                    for i in range(min(len(labels),len(opt_list))))
+                _q(line, indent=1.0)
+            if is_answer_key:
+                ans = q.get("answer","") or q.get("correct_option","")
+                if ans: _ans(ans)
+            global_n += 1
+        doc.add_paragraph()
+
+    # Section II
+    if 2 in groups and groups[2]:
+        qs = groups[2]; n2 = len(qs); ans2 = min(n2,7)
+        cq = global_n + ans2 - 1
+        _sec_row(doc, fn, ROMAN[2], H["sec2_main"],
+                 H["sec2_sub"].format(q=cq), f"{ans2}X2={ans2*2}")
+        for q in qs:
+            _q(f"{global_n}.  {q.get('question','')}")
+            if is_answer_key:
+                ans = q.get("answer","")
+                if ans: _ans(ans)
+            global_n += 1
+        doc.add_paragraph()
+
+    # Section III
+    if 3 in groups and groups[3]:
+        qs = groups[3]; n3 = len(qs); ans3 = min(n3,7)
+        cq = global_n + ans3 - 1
+        _sec_row(doc, fn, ROMAN[3], H["sec3_main"],
+                 H["sec3_sub"].format(q=cq), f"{ans3}X3={ans3*3}")
+        for q in qs:
+            _q(f"{global_n}.  {q.get('question','')}")
+            if is_answer_key:
+                ans = q.get("answer","")
+                if ans: _ans(ans)
+            global_n += 1
+        doc.add_paragraph()
+
+    # Section IV
+    if part_d_qs and pairs > 0:
+        _sec_row(doc, fn, ROMAN[4], H["sec4_main"], H["sec4_sub"],
+                 f"{pairs}X5={pairs*5}")
+        for i in range(0, len(part_d_qs)-1, 2):
+            qa  = part_d_qs[i].get("question","")
+            qb  = part_d_qs[i+1].get("question","")
+            ans = part_d_qs[i].get("answer","")
+            _q(f"{global_n}.  {qa}")
+            por = doc.add_paragraph()
+            por.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            _sp(por, 1, 1, LS)
+            r = por.add_run(H["or"]); _f(r, fn, 10)
+            _q(f"          {qb}")
+            if is_answer_key and ans:
+                _ans(ans)
+            doc.add_paragraph()
+            global_n += 1
+
+    return doc, global_n
+
+
+# ── Public: Question Paper DOCX ──────────────────────────────────────
 
 def generate_question_paper_docx(
         class_: str, subject: str, lesson: str,
@@ -152,15 +335,11 @@ def generate_question_paper_docx(
         output_path: str = None,
         part_d: list = None,
         test_name: str = "",
-        school_name: str = "") -> str:
-    """
-    Generate Tamil-supported Word question paper.
-    Returns file path or "" on failure.
-    """
-    if not DOCX_OK:
-        print("[DOCX] python-docx not installed.")
-        return ""
+        school_name: str = "",
+        start_number: int = 1) -> str:
 
+    if not DOCX_OK:
+        print("[DOCX] python-docx not installed."); return ""
     if output_path is None:
         os.makedirs("generated_papers", exist_ok=True)
         ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -168,220 +347,79 @@ def generate_question_paper_docx(
         output_path = os.path.join(
             "generated_papers", f"Class{class_}_{safe}_{ts}.docx")
 
-    fn = TAMIL_FONT
-    LS = 1.15
-
+    fn        = TAMIL_FONT
+    all_qs    = questions + (part_d or [])
+    lang      = _detect_language(all_qs)
+    H         = _HEADINGS[lang]
+    part_d_qs = part_d if part_d else []
+    other_qs  = [q for q in questions if q.get("marks") != 5]
+    groups    = {}
+    for q in other_qs:
+        groups.setdefault(q.get("marks",1),[]).append(q)
+    pairs = len(part_d_qs) // 2
+    total = (_score(1,len(groups.get(1,[]))) +
+             _score(2,len(groups.get(2,[]))) +
+             _score(3,len(groups.get(3,[]))) +
+             pairs * 5)
     try:
-        doc = Document()
-
-        # ── Page margins ──────────────────────────────────────────
-        for sec in doc.sections:
-            sec.page_width    = Cm(21.0)
-            sec.page_height   = Cm(29.7)
-            sec.left_margin   = Cm(2.0)
-            sec.right_margin  = Cm(2.0)
-            sec.top_margin    = Cm(1.9)
-            sec.bottom_margin = Cm(1.9)
-            _build_footer(sec, fn)
-
-        # ── Separate part_d from other questions ──────────────────
-        part_d_qs = part_d if part_d else []
-        other_qs  = [q for q in questions if q.get("marks") != 5]
-
-        # ── Compute CORRECT marks ─────────────────────────────────
-        # 2-mark: students answer only 7 of 10 → marks = 7×2 = 14
-        # 3-mark: students answer only 7 of 10 → marks = 7×3 = 21
-        # 5-mark: Either/Or pairs → marks = pairs × 5
-        # 1-mark: all attempted
-        groups = {}
-        for q in other_qs:
-            groups.setdefault(q.get("marks", 1), []).append(q)
-
-        actual_pairs = len(part_d_qs) // 2
-
-        def _score(mark, count):
-            """Return marks actually scored based on TN board pattern."""
-            if mark == 1:
-                return count * 1        # all attempted
-            elif mark == 2:
-                answered = min(count, 7)  # student answers 7
-                return answered * 2
-            elif mark == 3:
-                answered = min(count, 7)  # student answers 7
-                return answered * 3
-            elif mark == 5:
-                return actual_pairs * 5   # Either/Or pairs
-            return count * mark
-
-        total_marks = (
-            _score(1, len(groups.get(1, []))) +
-            _score(2, len(groups.get(2, []))) +
-            _score(3, len(groups.get(3, []))) +
-            actual_pairs * 5
-        )
-
-        # ── Header info ───────────────────────────────────────────
-        # Row 1: Test Name (or QUESTION PAPER) centered
-        if test_name or school_name:
-            top_text = test_name if test_name else "QUESTION PAPER"
-            if school_name:
-                top_text = f"{school_name}  —  {top_text}"
-            tp = doc.add_paragraph()
-            tp.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            _spacing(tp, before=0, after=4, ls=LS)
-            r = tp.add_run(top_text.upper())
-            _font(r, fn, 12, bold=True, color_hex="1A3A5C")
-
-        # Row 2: Class | Lesson(s) | Total Marks  (3-column table)
-        tbl  = doc.add_table(rows=1, cols=3)
-        tbl.style = "Table Grid"
-        cells = tbl.rows[0].cells
-
-        hdr_vals = [
-            f"Class : {class_}",
-            f"Lesson(s) : {lesson}",
-            f"Total Marks : {total_marks}",
-        ]
-        hdr_alns = [WD_ALIGN_PARAGRAPH.LEFT,
-                    WD_ALIGN_PARAGRAPH.CENTER,
-                    WD_ALIGN_PARAGRAPH.RIGHT]
-
-        for cell, txt, aln in zip(cells, hdr_vals, hdr_alns):
-            cell.text = ""
-            _no_border_cell(cell)
-            p = cell.paragraphs[0]
-            p.alignment = aln
-            _spacing(p, before=2, after=4, ls=LS)
-            r = p.add_run(txt)
-            _font(r, fn, 10, bold=True)
-
-        # Remove all table borders
-        tbl_pr = tbl._tbl.find(qn("w:tblPr"))
-        if tbl_pr is None:
-            tbl_pr = OxmlElement("w:tblPr")
-            tbl._tbl.insert(0, tbl_pr)
-        tb = OxmlElement("w:tblBorders")
-        for s in ["top","left","bottom","right","insideH","insideV"]:
-            e = OxmlElement(f"w:{s}")
-            e.set(qn("w:val"),   "none")
-            e.set(qn("w:sz"),    "0")
-            e.set(qn("w:color"), "auto")
-            tb.append(e)
-        tbl_pr.append(tb)
-
-        # Row 3: Marks breakdown  20×1=20  |  10×2=14  |  10×3=21  |  7×5=35
-        breakdown_parts = []
-        if 1 in groups and groups[1]:
-            n = len(groups[1])
-            breakdown_parts.append(f"{n}×1={n}")
-        if 2 in groups and groups[2]:
-            n = len(groups[2])
-            breakdown_parts.append(f"{n}×2={_score(2,n)}")
-        if 3 in groups and groups[3]:
-            n = len(groups[3])
-            breakdown_parts.append(f"{n}×3={_score(3,n)}")
-        if actual_pairs > 0:
-            breakdown_parts.append(f"{actual_pairs}×5={actual_pairs*5}")
-
-        if breakdown_parts:
-            bp = doc.add_paragraph()
-            bp.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            _spacing(bp, before=2, after=2, ls=LS)
-            r = bp.add_run("  |  ".join(breakdown_parts) +
-                            f"  =  {total_marks} Marks")
-            _font(r, fn, 9, color_hex="444444")
-
-        # Separator
-        sep = doc.add_paragraph()
-        _spacing(sep, before=2, after=6, ls=LS)
-        _hline(sep, color="1A3A5C", thick=2)
-
-        # Title (if no test name was provided)
-        if not test_name:
-            tp2 = doc.add_paragraph()
-            tp2.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            _spacing(tp2, before=4, after=10, ls=LS)
-            r = tp2.add_run("QUESTION PAPER")
-            _font(r, fn, 13, bold=True, color_hex="1A3A5C")
-
-        # ── Sections A / B / C ────────────────────────────────────
-        SEC = {
-            1: "Section A — Choose the Best Answer",
-            2: "Section B — Short Answer Questions",
-            3: "Section C — Brief Answer Questions",
-            5: "Section D — Long Answer / Essay (Either / Or)",
-        }
-
-        num = 1
-
-        for marks in sorted(groups.keys()):
-            qs       = groups[marks]
-            answered = min(len(qs), 7) if marks in (2, 3) else len(qs)
-            lbl      = SEC.get(marks, f"Section — {marks} Mark Questions")
-            sec_line = (f"{lbl}  "
-                        f"({len(qs)} × {marks}"
-                        + (f", Answer any {answered}" if marks in (2,3) and len(qs) > answered else "")
-                        + f" = {_score(marks, len(qs))} marks)")
-
-            sh = doc.add_paragraph()
-            _spacing(sh, before=10, after=4, ls=LS)
-            r  = sh.add_run(sec_line)
-            _font(r, fn, 11, bold=True, color_hex="1A3A5C")
-            _hline(sh, color="AAAAAA", thick=1)
-
-            for q in qs:
-                qp = doc.add_paragraph()
-                qp.paragraph_format.left_indent = Cm(0.5)
-                _spacing(qp, before=2, after=5, ls=LS)
-                _font(qp.add_run(f"{num}.  "), fn, 10, bold=True)
-                _font(qp.add_run(q.get("question", "")), fn, 10)
-                _font(qp.add_run(f"  [{marks}m]"), fn, 8,
-                       color_hex="888888")
-                num += 1
-
-        # ── Section D — Either / Or ───────────────────────────────
-        if part_d_qs:
-            pairs   = len(part_d_qs) // 2
-            sec_line = (f"{SEC[5]}  "
-                        f"({pairs} × 5 = {pairs*5} marks)")
-            sh = doc.add_paragraph()
-            _spacing(sh, before=10, after=4, ls=LS)
-            r  = sh.add_run(sec_line)
-            _font(r, fn, 11, bold=True, color_hex="1A3A5C")
-            _hline(sh, color="AAAAAA", thick=1)
-
-            for i in range(0, len(part_d_qs) - 1, 2):
-                qa = part_d_qs[i].get("question", "")
-                qb = part_d_qs[i+1].get("question", "")
-
-                pa = doc.add_paragraph()
-                pa.paragraph_format.left_indent = Cm(0.5)
-                _spacing(pa, before=2, after=2, ls=LS)
-                _font(pa.add_run(f"{num}a.  "), fn, 10, bold=True)
-                _font(pa.add_run(qa), fn, 10)
-                _font(pa.add_run("  [5m]"), fn, 8, color_hex="888888")
-
-                por = doc.add_paragraph()
-                por.paragraph_format.left_indent = Cm(1.5)
-                _spacing(por, before=1, after=1, ls=LS)
-                por.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                _font(por.add_run("(OR)"), fn, 10,
-                       bold=True, color_hex="555555")
-
-                pb = doc.add_paragraph()
-                pb.paragraph_format.left_indent = Cm(0.5)
-                _spacing(pb, before=2, after=8, ls=LS)
-                _font(pb.add_run(f"{num}b.  "), fn, 10, bold=True)
-                _font(pb.add_run(qb), fn, 10)
-                _font(pb.add_run("  [5m]"), fn, 8, color_hex="888888")
-
-                num += 1
-
+        doc, _ = _build_doc(
+            class_, subject, lesson, groups, part_d_qs,
+            pairs, total, school_name, test_name, fn, H,
+            is_answer_key=False, start_number=start_number)
         doc.save(output_path)
-        print(f"[DOCX] Saved: {output_path}")
+        print(f"[DOCX] Question paper: {output_path}")
         return output_path
-
     except Exception as e:
         print(f"[DOCX] Failed: {e}")
+        import traceback; traceback.print_exc()
+        return ""
+
+
+# ── Public: Answer Key DOCX ──────────────────────────────────────────
+
+def generate_answer_key_docx(
+        class_: str, subject: str, lesson: str,
+        questions: list, teacher_name: str = "",
+        output_path: str = None,
+        part_d: list = None,
+        test_name: str = "",
+        school_name: str = "",
+        start_number: int = 1) -> str:
+
+    if not DOCX_OK:
+        print("[DOCX] python-docx not installed."); return ""
+    if output_path is None:
+        os.makedirs("generated_papers", exist_ok=True)
+        ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe = subject.replace(" ", "_")
+        output_path = os.path.join(
+            "generated_papers",
+            f"Class{class_}_{safe}_{ts}_ANSWER_KEY.docx")
+
+    fn        = TAMIL_FONT
+    all_qs    = questions + (part_d or [])
+    lang      = _detect_language(all_qs)
+    H         = _HEADINGS[lang]
+    part_d_qs = part_d if part_d else []
+    other_qs  = [q for q in questions if q.get("marks") != 5]
+    groups    = {}
+    for q in other_qs:
+        groups.setdefault(q.get("marks",1),[]).append(q)
+    pairs = len(part_d_qs) // 2
+    total = (_score(1,len(groups.get(1,[]))) +
+             _score(2,len(groups.get(2,[]))) +
+             _score(3,len(groups.get(3,[]))) +
+             pairs * 5)
+    try:
+        doc, _ = _build_doc(
+            class_, subject, lesson, groups, part_d_qs,
+            pairs, total, school_name, test_name, fn, H,
+            is_answer_key=True, start_number=start_number,
+            wm_text="Answer Key — EduPulse-JB")
+        doc.save(output_path)
+        print(f"[DOCX] Answer key: {output_path}")
+        return output_path
+    except Exception as e:
+        print(f"[DOCX] Answer key failed: {e}")
         import traceback; traceback.print_exc()
         return ""
