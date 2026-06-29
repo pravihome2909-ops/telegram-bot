@@ -24,27 +24,155 @@ from config import EXAM_FOOTER
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 _FONT_CANDIDATES = [
-    ("/usr/share/fonts/truetype/freefont/FreeSans.ttf",           "FreeSans"),
+    # Bundled font — verified to contain actual Tamil glyphs (highest priority)
+    (os.path.join(BASE_DIR, "NotoSansTamil-Regular.ttf"),         "Noto Sans Tamil"),
     ("/usr/share/fonts/truetype/lohit-tamil/Lohit-Tamil.ttf",     "Lohit Tamil"),
     ("/usr/share/fonts/truetype/noto/NotoSansTamil-Regular.ttf",  "Noto Sans Tamil"),
     ("/usr/share/fonts/opentype/noto/NotoSansTamil-Regular.ttf",  "Noto Sans Tamil"),
-    (os.path.join(BASE_DIR, "NotoSansTamil-Regular.ttf"),         "Noto Sans Tamil"),
-    (os.path.join(BASE_DIR, "Latha.ttf"),                         "Latha"),
-    (os.path.join(BASE_DIR, "FreeSans.ttf"),                      "FreeSans"),
     ("C:/Windows/Fonts/Latha.ttf",                                "Latha"),
     ("C:/Windows/Fonts/latha.ttf",                                "Latha"),
+    (os.path.join(BASE_DIR, "Latha.ttf"),                         "Latha"),
+    # NOTE: FreeSans.ttf intentionally removed — verified to NOT contain
+    # Tamil glyphs, which was causing boxes in generated documents.
 ]
 
 def _detect_font():
     for path, name in _FONT_CANDIDATES:
         if os.path.exists(path) and os.path.getsize(path) > 5000:
-            print(f"[DOCX] Tamil font: {name}")
-            return name
-    print("[DOCX] No Tamil font — using Arial")
-    return "Arial"
+            print(f"[DOCX] Tamil font: {name}  ({path})")
+            return name, path
+    print("[DOCX] No Tamil font — using Arial (will show boxes for Tamil)")
+    return "Arial", None
 
-TAMIL_FONT = _detect_font()
+TAMIL_FONT, TAMIL_FONT_PATH = _detect_font()
 ROMAN = {1: "I", 2: "II", 3: "III", 4: "IV"}
+
+
+# ── Font embedding (so Tamil displays even without the font installed) ──
+
+def _embed_font(doc: "Document", font_path: str, font_name: str):
+    """
+    Embed a TTF font file directly inside the .docx package.
+    This makes the document self-contained — Tamil will render correctly
+    even on a PC that does not have the font installed, as long as the
+    viewer (Word / LibreOffice) honours embedded fonts.
+    """
+    if not font_path or not os.path.exists(font_path):
+        return
+    try:
+        import shutil
+        from docx.oxml.ns import nsmap
+        import zipfile
+
+        # python-docx doesn't natively support font embedding, so we
+        # inject it directly via the package's OPC parts after save.
+        # Mark the flag — actual embedding happens in _post_embed_fonts()
+        doc._embed_font_path = font_path
+        doc._embed_font_name = font_name
+    except Exception as e:
+        print(f"[DOCX] Font embed prep error: {e}")
+
+
+def _post_embed_fonts(docx_path: str, font_path: str, font_name: str):
+    """
+    Post-process the saved .docx to embed the TTF font file.
+    Adds: word/fonts/font1.fntdata, fontTable.xml entry,
+    [Content_Types].xml override, and document settings flag.
+    """
+    if not font_path or not os.path.exists(font_path):
+        return False
+    try:
+        import zipfile
+        import shutil
+        import tempfile
+
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".docx")
+        os.close(tmp_fd)
+        shutil.copy2(docx_path, tmp_path)
+
+        with zipfile.ZipFile(tmp_path, "r") as zin:
+            names = zin.namelist()
+            data  = {n: zin.read(n) for n in names}
+
+        # Read font binary
+        with open(font_path, "rb") as f:
+            font_bytes = f.read()
+
+        # 1. Add font binary to word/fonts/
+        data["word/fonts/font1.fntdata"] = font_bytes
+
+        # 2. Update [Content_Types].xml — register .fntdata extension
+        ct_xml = data.get("[Content_Types].xml", b"").decode("utf-8")
+        if "fntdata" not in ct_xml:
+            ct_xml = ct_xml.replace(
+                "</Types>",
+                '<Default Extension="fntdata" '
+                'ContentType="application/x-font-data"/></Types>')
+        data["[Content_Types].xml"] = ct_xml.encode("utf-8")
+
+        # 3. Create/extend word/fontTable.xml
+        font_table = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<w:fonts xmlns:w="http://schemas.openxmlformats.org/'
+            'wordprocessingml/2006/main" xmlns:r="http://schemas.'
+            'openxmlformats.org/officeDocument/2006/relationships">'
+            f'<w:font w:name="{font_name}">'
+            '<w:embedRegular r:id="rIdFont1" w:fontKey="{00000000-0000-0000-0000-000000000000}"/>'
+            '</w:font></w:fonts>'
+        )
+        data["word/fontTable.xml"] = font_table.encode("utf-8")
+
+        # 4. fontTable relationships
+        rels_path = "word/_rels/fontTable.xml.rels"
+        rels_xml = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/'
+            'package/2006/relationships">'
+            '<Relationship Id="rIdFont1" '
+            'Type="http://schemas.openxmlformats.org/officeDocument/'
+            '2006/relationships/font" Target="fonts/font1.fntdata"/>'
+            '</Relationships>'
+        )
+        data[rels_path] = rels_xml.encode("utf-8")
+
+        # 5. Reference fontTable.xml from document.xml.rels
+        doc_rels_path = "word/_rels/document.xml.rels"
+        doc_rels = data.get(doc_rels_path, b"").decode("utf-8")
+        if "fontTable.xml" not in doc_rels:
+            doc_rels = doc_rels.replace(
+                "</Relationships>",
+                '<Relationship Id="rIdFontTable" '
+                'Type="http://schemas.openxmlformats.org/officeDocument/'
+                '2006/relationships/fontTable" Target="fontTable.xml"/>'
+                '</Relationships>')
+        data[doc_rels_path] = doc_rels.encode("utf-8")
+
+        # 6. Add embedTrueTypeFonts flag to settings.xml
+        settings_path = "word/settings.xml"
+        settings_xml = data.get(settings_path, b"").decode("utf-8")
+        if "embedTrueTypeFonts" not in settings_xml:
+            settings_xml = settings_xml.replace(
+                "<w:settings",
+                "<w:settings", 1)  # no-op placeholder for clarity
+            settings_xml = settings_xml.replace(
+                "</w:settings>",
+                '<w:embedTrueTypeFonts/><w:embedSystemFonts/>'
+                '</w:settings>')
+        data[settings_path] = settings_xml.encode("utf-8")
+
+        # Write final zip back over the original docx
+        with zipfile.ZipFile(docx_path, "w", zipfile.ZIP_DEFLATED) as zout:
+            for name, content in data.items():
+                zout.writestr(name, content)
+
+        os.unlink(tmp_path)
+        print(f"[DOCX] Font '{font_name}' embedded successfully.")
+        return True
+
+    except Exception as e:
+        print(f"[DOCX] Font embedding failed (non-fatal): {e}")
+        import traceback; traceback.print_exc()
+        return False
 
 
 # ── Language detection ────────────────────────────────────────────────
@@ -367,6 +495,8 @@ def generate_question_paper_docx(
             pairs, total, school_name, test_name, fn, H,
             is_answer_key=False, start_number=start_number)
         doc.save(output_path)
+        if TAMIL_FONT_PATH:
+            _post_embed_fonts(output_path, TAMIL_FONT_PATH, TAMIL_FONT)
         print(f"[DOCX] Question paper: {output_path}")
         return output_path
     except Exception as e:
@@ -417,6 +547,8 @@ def generate_answer_key_docx(
             is_answer_key=True, start_number=start_number,
             wm_text="Answer Key — EduPulse-JB")
         doc.save(output_path)
+        if TAMIL_FONT_PATH:
+            _post_embed_fonts(output_path, TAMIL_FONT_PATH, TAMIL_FONT)
         print(f"[DOCX] Answer key: {output_path}")
         return output_path
     except Exception as e:
