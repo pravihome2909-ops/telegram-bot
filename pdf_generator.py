@@ -28,15 +28,18 @@ from config import EXAM_FOOTER
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 TAMIL_CANDIDATES = [
-    ("/usr/share/fonts/truetype/freefont/FreeSans.ttf",           "FreeSans"),
+    # Bundled font — verified to contain actual Tamil glyphs (highest priority)
+    (os.path.join(BASE_DIR, "NotoSansTamil-Regular.ttf"),         "NotoSansTamil"),
+    # Common Linux Tamil-capable font locations
     ("/usr/share/fonts/truetype/lohit-tamil/Lohit-Tamil.ttf",     "Lohit-Tamil"),
     ("/usr/share/fonts/truetype/noto/NotoSansTamil-Regular.ttf",  "NotoSansTamil"),
     ("/usr/share/fonts/opentype/noto/NotoSansTamil-Regular.ttf",  "NotoSansTamil"),
-    (os.path.join(BASE_DIR, "NotoSansTamil-Regular.ttf"),         "NotoSansTamil"),
-    (os.path.join(BASE_DIR, "Latha.ttf"),                         "Latha"),
-    (os.path.join(BASE_DIR, "FreeSans.ttf"),                      "FreeSans"),
+    # Windows built-in Tamil font
     ("C:/Windows/Fonts/Latha.ttf",                                "Latha"),
     ("C:/Windows/Fonts/latha.ttf",                                "Latha"),
+    (os.path.join(BASE_DIR, "Latha.ttf"),                         "Latha"),
+    # NOTE: FreeSans.ttf intentionally removed — it does NOT contain
+    # Tamil Unicode glyphs (verified), so it was causing boxes to appear.
 ]
 
 _FONT_NAME = None
